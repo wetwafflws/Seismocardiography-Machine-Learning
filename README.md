@@ -19,7 +19,7 @@ Includes data visualization and signal processing tools via PyQt6 GUI and Stream
 
 ### Step 1: Clone/Setup Repository
 ```bash
-git clone <repository-url>
+git clone https://github.com/wetwafflws/Seismocardiography-Machine-Learning 
 cd SCG_MachineLearning
 ```
 
@@ -71,7 +71,8 @@ SCG_MachineLearning/
 
 ## Data Setup
 
-**Important**: The `Data/` folder is not included in the repository due to size and privacy considerations.
+The data is not included in the repository and can be found through this study:
+Yang C, Fan F, Aranoff N, Green P, Li Y, Liu C and Tavassolian N (2021) An Open-Access Database for the Evaluation of Cardio-Mechanical Signals From Patients With Valvular Heart Diseases. Front. Physiol. 12:750221. doi: 10.3389/fphys.2021.750221
 
 ### Adding Your Data
 
@@ -131,10 +132,3 @@ These are automatically loaded when running inference.
 - Original sampling frequencies are auto-detected based on patient ID
 - Signal processing includes resampling, filtering, and decomposition
 
-## License
-
-[Add your license information here]
-
-## Contact
-
-[Add contact information]
