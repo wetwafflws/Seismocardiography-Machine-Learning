@@ -1,0 +1,28 @@
+# Data folders (large and user-specific)
+Data/
+Saved_Peaks/
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# PyTorch models (optional - uncomment if you want to exclude)
+# *.pt
