@@ -18,7 +18,7 @@ from collections import deque
 
 from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QLabel, QComboBox, QPushButton, QSplitter, QFrame, QSizePolicy,
+    QLabel, QComboBox, QPushButton, QSplitter, QFrame, QSizePolicy, QCheckBox,
     QFileDialog, QMessageBox
 )
 from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal, QObject
@@ -26,6 +26,7 @@ from PyQt5.QtGui import QFont, QColor, QPalette
 
 import pyqtgraph as pg
 import numpy as np
+from scipy.signal import butter, sosfilt
 
 # ─── Protocol ────────────────────────────────────────────────────────────────
 
@@ -266,6 +267,8 @@ SAMPLE_RATE  = 256        # Hz
 WINDOW_N     = WINDOW_SECS * SAMPLE_RATE   # samples in rolling window
 BPM_HISTORY  = 8          # beats used for BPM average
 MAX_PLOT_POINTS = 2000     # cap visible samples per curve for faster UI redraw
+BPF_LOW_HZ = 0.5
+BPF_HIGH_HZ = 50.0
 
 # GY-61 (ADXL335) analog conversion from MCU ADC counts to g.
 # Firmware currently packs ADC samples as int16, so we unwrap to uint16 first.
@@ -314,6 +317,11 @@ class MainWindow(QMainWindow):
         self._record_first_ts = None
         self._record_last_ts = None
         self._record_elapsed_secs = 0
+
+        # Optional display/data filter
+        self._filter_enabled = False
+        self._bpf_sos = butter(2, [BPF_LOW_HZ, BPF_HIGH_HZ], btype='bandpass', fs=SAMPLE_RATE, output='sos')
+        self._reset_filter_state()
 
         self._record_timer = QTimer(self)
         self._record_timer.timeout.connect(self._update_record_timer)
@@ -492,6 +500,11 @@ class MainWindow(QMainWindow):
         self._record_timer_lbl.setAlignment(Qt.AlignCenter)
         layout.addWidget(self._record_timer_lbl)
 
+        self._filter_checkbox = QCheckBox("BANDPASS 0.5–50 Hz")
+        self._filter_checkbox.setChecked(False)
+        self._filter_checkbox.toggled.connect(self._on_filter_toggled)
+        layout.addWidget(self._filter_checkbox)
+
         # ── Clear button ──────────────────────────────────────────────────────
         clear_btn = QPushButton("CLEAR PLOTS")
         clear_btn.clicked.connect(self._clear_data)
@@ -568,6 +581,22 @@ class MainWindow(QMainWindow):
         self._status_lbl.setStyleSheet(f"color:{ACCENT2};")
         self._on_disconnect()
 
+    def _reset_filter_state(self):
+        n_sections = self._bpf_sos.shape[0]
+        self._zi_x = np.zeros((n_sections, 2), dtype=np.float64)
+        self._zi_y = np.zeros((n_sections, 2), dtype=np.float64)
+        self._zi_z = np.zeros((n_sections, 2), dtype=np.float64)
+
+    def _apply_filter_sample(self, x_val: float, y_val: float, z_val: float) -> tuple[float, float, float]:
+        x_out, self._zi_x = sosfilt(self._bpf_sos, np.array([x_val], dtype=np.float64), zi=self._zi_x)
+        y_out, self._zi_y = sosfilt(self._bpf_sos, np.array([y_val], dtype=np.float64), zi=self._zi_y)
+        z_out, self._zi_z = sosfilt(self._bpf_sos, np.array([z_val], dtype=np.float64), zi=self._zi_z)
+        return float(x_out[0]), float(y_out[0]), float(z_out[0])
+
+    def _on_filter_toggled(self, checked: bool):
+        self._filter_enabled = checked
+        self._reset_filter_state()
+
     # ── Data ingestion ────────────────────────────────────────────────────────
 
     def _on_data(self, scg_samples: list, beat_timestamps: list):
@@ -576,10 +605,17 @@ class MainWindow(QMainWindow):
             y_counts = raw_packet_int16_to_adc_counts(y)
             z_counts = raw_packet_int16_to_adc_counts(z)
 
+            x_g = adc_counts_to_g(x_counts)
+            y_g = adc_counts_to_g(y_counts)
+            z_g = adc_counts_to_g(z_counts)
+
+            if self._filter_enabled:
+                x_g, y_g, z_g = self._apply_filter_sample(x_g, y_g, z_g)
+
             self._scg_ts.append(int(ts))
-            self._scg_x.append(adc_counts_to_g(x_counts))
-            self._scg_y.append(adc_counts_to_g(y_counts))
-            self._scg_z.append(adc_counts_to_g(z_counts))
+            self._scg_x.append(x_g)
+            self._scg_y.append(y_g)
+            self._scg_z.append(z_g)
             self._sample_count += 1
             self._rate_count   += 1
 
@@ -809,6 +845,7 @@ class MainWindow(QMainWindow):
         self._scg_y = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
         self._scg_z = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
         self._scg_ts = deque([0] * WINDOW_N, maxlen=WINDOW_N)
+        self._reset_filter_state()
         self._beat_ts.clear()
         self._beat_intervals.clear()
         self._last_beat_ts = None
