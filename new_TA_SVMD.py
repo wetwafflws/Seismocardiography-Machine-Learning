@@ -4,6 +4,7 @@ import numpy as np
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import os
+import sys
 import time
 import json
 import pandas as pd
@@ -11,6 +12,15 @@ from scipy import signal
 from scipy.signal import find_peaks
 from scipy.signal import savgol_filter
 from scipy.stats import zscore
+from pathlib import Path
+
+
+APP_ROOT = Path(__file__).resolve().parent
+SRC_ROOT = APP_ROOT / "src"
+if str(SRC_ROOT) not in sys.path:
+    sys.path.insert(0, str(SRC_ROOT))
+
+from svmd_prototype import svmd as legacy_svmd
 
 
 def format_timestamp(seconds_val):
@@ -50,267 +60,25 @@ st.set_page_config(page_title="CEBS Data Viewer & Replication", layout="wide")
 # 1. ALGORITHM IMPLEMENTATION (SVMD)
 # ==========================================
 
-def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=1, init_omega=0):
-    """
-    Successive Variational Mode Decomposition (SVMD)
-    A drop-in Python replacement corresponding to the original MATLAB script.
-    """
-    signal_in = np.array(signal_in).flatten()
-    if len(signal_in) % 2 > 0:
-        signal_in = signal_in[:-1]
-        
-    # Estimate the noise via Savitzky-Golay filter (matches MATLAB: sgolayfilt(signal,8,25))
-    y = savgol_filter(signal_in, window_length=25, polyorder=8)
-    signoise = signal_in - y
-    
-    save_T = len(signal_in)
-    fs = 1.0 / save_T
-    
-    # Mirror the signal and noise to extend (Part 1)
-    T_half = save_T // 2
-    f_mir = np.zeros(2 * save_T)
-    f_mir_noise = np.zeros(2 * save_T)
-    
-    f_mir[0:T_half] = signal_in[T_half-1::-1]
-    f_mir_noise[0:T_half] = signoise[T_half-1::-1]
-    
-    f_mir[T_half:save_T + T_half] = signal_in
-    f_mir_noise[T_half:save_T + T_half] = signoise
-    
-    f_mir[save_T + T_half:2 * save_T] = signal_in[save_T-1:T_half-1:-1]
-    f_mir_noise[save_T + T_half:2 * save_T] = signoise[save_T-1:T_half-1:-1]
-    
-    f = f_mir
-    fnoise = f_mir_noise
-    T = len(f)
-    
-    t = np.arange(1, T + 1) / T
-    omega_freqs = t - 0.5 - 1.0/T
-    
-    # FFT and one-sided preparations
-    f_hat = np.fft.fftshift(np.fft.fft(f))
-    f_hat_onesided = f_hat.copy()
-    f_hat_onesided[0:T//2] = 0
-    
-    f_hat_n = np.fft.fftshift(np.fft.fft(fnoise))
-    f_hat_n_onesided = f_hat_n.copy()
-    f_hat_n_onesided[0:T//2] = 0
-    
-    noisepe = np.linalg.norm(f_hat_n_onesided, 2)**2
-    
-    N_max = 300
-    omega_L = np.zeros(N_max)
-    if init_omega == 0:
-        omega_L[0] = 0.0
-    else:
-        omega_L[0] = np.sort(np.exp(np.log(fs) + (np.log(0.5) - np.log(fs)) * np.random.rand(1)))[0]
-        
-    minAlpha = 10
-    Alpha = minAlpha
-    
-    n = 0
-    m_val = 0
-    SC2 = 0
-    l = 0
-    bf = 0
-    
-    BIC = []
-    h_hat_Temp = []
-    u_hat_Temp = []
-    u_hat_i = []
-    alpha_arr = []
-    
-    n2 = 0
-    polm = []
-    polm_temp = 1.0
-    
-    omega_d_Temp = []
-    sigerror = []
-    gamma = []
-    normind = []
-    
-    lambda_arr = np.zeros((N_max, len(omega_freqs)), dtype=complex)
-    u_hat_L = np.zeros((N_max, len(omega_freqs)), dtype=complex)
-    
-    # Part 2: Main loop for iterative updates
-    while SC2 != 1:
-        while Alpha < (max_alpha + 1):
-            udiff = tol + np.finfo(float).eps
-            while udiff > tol and n < N_max - 1:
-                
-                sum_h_hat = np.sum(h_hat_Temp, axis=0) if len(h_hat_Temp) > 0 else np.zeros(len(omega_freqs))
-                sum_u_i = np.sum(u_hat_i, axis=0) if len(u_hat_i) > 0 else np.zeros(len(omega_freqs), dtype=complex)
-                
-                freq_diff = omega_freqs - omega_L[n]
-                freq_diff_sq = freq_diff**2
-                freq_diff_pow4 = freq_diff_sq**2
-                alpha_sq = Alpha**2
-                
-                # Update u_hat_L
-                num_u = f_hat_onesided + (alpha_sq * freq_diff_pow4) * u_hat_L[n, :] + lambda_arr[n, :] / 2.0
-                den_u = 1 + alpha_sq * freq_diff_pow4 * (1 + 2 * Alpha * freq_diff_sq) + sum_h_hat
-                u_hat_L[n+1, :] = num_u / den_u
-                
-                # Update omega_L
-                pos = slice(T//2, T)
-                mag_sq = np.abs(u_hat_L[n+1, pos])**2
-                den_omega = np.sum(mag_sq)
-                if den_omega > 0:
-                    omega_L[n+1] = np.dot(omega_freqs[pos], mag_sq) / den_omega
-                else:
-                    omega_L[n+1] = omega_L[n]
-                    
-                # Update lambda (dual ascent)
-                term1 = alpha_sq * freq_diff_pow4
-                inner_paren = f_hat_onesided - u_hat_L[n+1, :] - sum_u_i + lambda_arr[n, :] / 2.0
-                num_tau = term1 * inner_paren - sum_u_i
-                den_tau = 1 + term1
-                
-                lambda_arr[n+1, :] = lambda_arr[n, :] + tau * (f_hat_onesided - (u_hat_L[n+1, :] + num_tau / den_tau) + sum_u_i)
-                
-                # Update criteria
-                udiff = np.finfo(float).eps
-                diff_u = u_hat_L[n+1, :] - u_hat_L[n, :]
-                num_udiff = np.sum(diff_u * np.conj(diff_u)).real / T
-                den_udiff = np.sum(u_hat_L[n, :] * np.conj(u_hat_L[n, :])).real / T
-                
-                if den_udiff > 0:
-                    udiff += np.abs(num_udiff / den_udiff)
-                udiff = np.abs(udiff)
-                
-                n += 1
-                
-            # Part 3: Increasing Alpha
-            if abs(m_val - np.log(max_alpha)) > 1:
-                m_val += 1
-            else:
-                m_val += 0.05
-                bf += 1
-                
-            if bf >= 2:
-                Alpha += 1
-                
-            if Alpha <= (max_alpha - 1):
-                if bf == 1:
-                    Alpha = max_alpha - 1
-                else:
-                    Alpha = np.exp(m_val)
-                
-                omega_L[0] = omega_L[n]
-                temp_ud = u_hat_L[n, :].copy()
-                n = 0
-                lambda_arr = np.zeros((N_max, len(omega_freqs)), dtype=complex)
-                u_hat_L = np.zeros((N_max, len(omega_freqs)), dtype=complex)
-                u_hat_L[0, :] = temp_ud
+def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=1, init_omega=0, **kwargs):
+    """Adapter that routes the Streamlit app to the earlier repo implementation.
 
-        # Part 4: Saving the Modes and Center Frequencies
-        valid_omegas = omega_L[omega_L > 0]
-        if len(valid_omegas) > 0:
-            idx = max(0, min(n - 1, len(valid_omegas) - 1))
-            omega_d_Temp.append(valid_omegas[idx])
-        else:
-            omega_d_Temp.append(0.0)
-            
-        u_hat_Temp.append(u_hat_L[n, :].copy())
-        alpha_arr.append(Alpha)
-        
-        Alpha = minAlpha
-        bf = 0
-        
-        # Initialize omega_L for the next run
-        if init_omega > 0:
-            ii = 0
-            while ii < 1 and n2 < 300:
-                rand_omega = np.exp(np.log(fs) + (np.log(0.5) - np.log(fs)) * np.random.rand())
-                checkp = np.abs(np.array(omega_d_Temp) - rand_omega)
-                if len(checkp[checkp < 0.02]) <= 0:
-                    ii = 1
-                n2 += 1
-            omega_L_start = rand_omega
-        else:
-            omega_L_start = 0.0
-            
-        lambda_arr = np.zeros((N_max, len(omega_freqs)), dtype=complex)
-        gamma.append(1)
-        
-        h_hat_new = gamma[l] / ((alpha_arr[l]**2) * (omega_freqs - omega_d_Temp[l])**4)
-        h_hat_Temp.append(h_hat_new)
-        u_hat_i.append(u_hat_Temp[l])
-        
-        sum_u_i = np.sum(u_hat_i, axis=0) if len(u_hat_i) > 0 else np.zeros(len(omega_freqs), dtype=complex)
-        
-        # Part 5: Stopping Criteria Handling
-        if stopc == 1:
-            # Presence of Noise
-            sigerror_val = np.linalg.norm(f_hat_onesided - sum_u_i, 2)**2
-            sigerror.append(sigerror_val)
-            if n2 >= 300 or sigerror[l] <= np.round(noisepe):
-                SC2 = 1
-                
-        elif stopc == 2:
-            # Exact Reconstruction
-            sum_u_temp = np.sum(u_hat_Temp, axis=0)
-            normind_val = (1/T) * np.linalg.norm(sum_u_temp - f_hat_onesided, 2)**2 / ((1/T) * np.linalg.norm(f_hat_onesided, 2)**2)
-            normind.append(normind_val)
-            if n2 >= 300 or normind[l] < 0.005:
-                SC2 = 1
-                
-        elif stopc == 3:
-            # Bayesian Method
-            sigerror_val = np.linalg.norm(f_hat_onesided - sum_u_i, 2)**2
-            sigerror.append(sigerror_val)
-            BIC_val = 2 * T * np.log(sigerror[l]) + (3 * (l + 1)) * np.log(2 * T)
-            BIC.append(BIC_val)
-            if l > 0 and BIC[l] > BIC[l-1]:
-                SC2 = 1
-                
-        else:
-            # Power of the Last Mode
-            term = (4 * alpha_arr[l] * u_hat_i[l]) / (1 + 2 * alpha_arr[l] * (omega_freqs - omega_d_Temp[l])**2)
-            dot_prod = np.sum(term * np.conj(u_hat_i[l]))
-            polm_val = np.abs(dot_prod)
-            
-            if l == 0:
-                polm.append(polm_val)
-                polm_temp = polm[0]
-                polm[0] = 1.0
-            else:
-                polm.append(polm_val / polm_temp)
-                
-            if l > 0 and abs(polm[l] - polm[l-1]) < 0.001:
-                SC2 = 1
-                
-        # Part 6: Reset the counters
-        u_hat_L = np.zeros((N_max, len(omega_freqs)), dtype=complex)
-        omega_L = np.zeros(N_max)
-        omega_L[0] = omega_L_start
-        n = 0
-        l += 1
-        m_val = 0
-        n2 = 0
-        
-    # Part 7: Signal Reconstruction
-    omega_final = np.array(omega_d_Temp)
-    L = len(omega_final)
-    u_hat = np.zeros((T, L), dtype=complex)
-    
-    for idx in range(L):
-        u_hat[T//2:T, idx] = u_hat_Temp[idx][T//2:T]
-        u_hat[T//2:0:-1, idx] = np.conj(u_hat_Temp[idx][T//2:T])
-        u_hat[0, idx] = np.conj(u_hat[-1, idx])
-        
-    u = np.zeros((L, T))
-    for idx in range(L):
-        u[idx, :] = np.real(np.fft.ifft(np.fft.ifftshift(u_hat[:, idx])))
-        
-    indic = np.argsort(omega_final)
-    omega_final = omega_final[indic]
-    u = u[indic, :]
-    
-    # Remove mirror part to match original size
-    u_final = u[:, T//4 : 3*T//4]
-    
-    return u_final, omega_final
+    The legacy repository function returns (u_time, u_hat_final, omega_sorted);
+    this UI only needs the time-domain modes and center frequencies, so the
+    wrapper keeps the existing two-value contract used throughout this file.
+    """
+    u_time, _, omega = legacy_svmd(
+        signal_in,
+        max_alpha=max_alpha,
+        tau=tau,
+        tol=tol,
+        stopc=stopc,
+        init_omega=init_omega,
+        **kwargs,
+    )
+    return u_time, omega
+
+
 
 # ==========================================
 # 2. PREPROCESSING 
@@ -334,6 +102,62 @@ def resample_for_processing(raw_signal, fs_original, target_fs=500):
         return np.asarray(raw_signal), fs_original
     num_samples = int(len(raw_signal) * (target_fs / fs_original))
     return signal.resample(raw_signal, num_samples), target_fs
+
+
+def convert_peak_indices_fs(peaks, fs_from, fs_to, max_len=None):
+    """Convert peak sample indices between sampling rates and clip to valid bounds."""
+    peaks = np.asarray(peaks, dtype=int)
+    if peaks.size == 0:
+        return peaks
+
+    if fs_from != fs_to:
+        peaks = np.round(peaks.astype(float) * (fs_to / fs_from)).astype(int)
+
+    if max_len is not None:
+        peaks = peaks[(peaks >= 0) & (peaks < int(max_len))]
+    else:
+        peaks = peaks[peaks >= 0]
+
+    if peaks.size == 0:
+        return peaks
+
+    return np.unique(peaks)
+
+
+def extract_wfdb_r_peaks(annotation):
+    """Return beat-annotation sample indices (R-peak-like) from a WFDB annotation object."""
+    if annotation is None:
+        return np.array([], dtype=int)
+
+    samples = np.asarray(getattr(annotation, "sample", np.array([])), dtype=int)
+    symbols = getattr(annotation, "symbol", None)
+
+    # If symbols are unavailable/mismatched, keep unique samples as a fallback.
+    if symbols is None or len(symbols) != len(samples):
+        return np.unique(samples)
+
+    # Keep only beat annotations; exclude rhythm/meta markers that cause duplicates/misalignment.
+    beat_symbols = {
+        'N', 'L', 'R', 'B', 'A', 'a', 'J', 'S', 'V', 'r', 'F', 'e', 'j', 'n', 'E', 'f', 'Q', '?', '/'
+    }
+    mask = np.array([sym in beat_symbols for sym in symbols], dtype=bool)
+    return np.unique(samples[mask])
+
+
+def get_first_annotated_peak_idx(peaks):
+    """Return the first annotated ECG peak index, or 0 if unavailable."""
+    peaks = np.asarray(peaks, dtype=int)
+    return int(peaks[0]) if peaks.size > 0 else 0
+
+
+def get_last_annotated_peak_idx(peaks, fallback_len=None):
+    """Return the last annotated ECG peak index, or a valid fallback end index."""
+    peaks = np.asarray(peaks, dtype=int)
+    if peaks.size > 0:
+        return int(peaks[-1])
+    if fallback_len is not None:
+        return max(0, int(fallback_len) - 1)
+    return 0
 
 def get_unhealthy_patient_ids():
     cp_ids = [f"CP-{i:02d}" for i in range(1, 71)]
@@ -426,7 +250,9 @@ def apply_mti_filter(raw_signal):
     y_detrended = signal.detrend(y_filtered)
     y_smoothed = signal.medfilt(y_detrended, kernel_size=5)
     
-    return y_smoothed
+    # return y_smoothed
+    return raw_signal
+
 
 # ==========================================
 # 3. WAVEFORM FACTOR & RECONSTRUCTION
@@ -658,9 +484,9 @@ else:
         
         st.divider()
         st.subheader("5. Full Record Analysis")
-        full_record_btn = st.button("🔍 Analyze Full Record", type="primary")
+        full_record_btn = st.button("ðŸ” Analyze Full Record", type="primary")
         remove_outliers = st.checkbox("Remove Outlier Intervals (IQR method)", value=False,
-                                     help="Remove interval pairs where either value is beyond 1.5×IQR from Q1/Q3. Maintains equal AO-AO and R-R counts.")
+                                     help="Remove interval pairs where either value is beyond 1.5Ã—IQR from Q1/Q3. Maintains equal AO-AO and R-R counts.")
         
         st.divider()
         st.subheader("6. Batch Full Record Analysis")
@@ -675,7 +501,7 @@ else:
             )
 
         batch_full_record_btn = st.button(
-            "🔄 Analyze Full Records for All (Batch)",
+            "ðŸ”„ Analyze Full Records for All (Batch)",
             type="secondary"
         )
 
@@ -721,12 +547,17 @@ else:
         anns = None
         try:
             annotation = wfdb.rdann(os.path.join(db_path, selected_record), 'atr')
-            anns = annotation.sample
+            anns = extract_wfdb_r_peaks(annotation)
         except: pass
 
         # Build one processing stream (<=500 Hz) for algorithmic steps
         scg_proc_full, fs_proc = resample_for_processing(signals[:, 3], fs, target_fs=500)
         ecg_proc_full, _ = resample_for_processing(signals[:, 0], fs, target_fs=500)
+        if is_unhealthy:
+            r_peaks_ref = np.asarray(r_peaks_indices, dtype=int)
+        else:
+            r_peaks_ref = np.asarray(anns if anns is not None else np.array([]), dtype=int)
+        r_peaks_proc_full = convert_peak_indices_fs(r_peaks_ref, fs, fs_proc, max_len=len(ecg_proc_full))
         scg_filtered_full = apply_mti_filter(scg_proc_full) if use_mti else scg_proc_full
         scg_filtered_full_display = signal.resample(scg_filtered_full, len(signals[:, 3])) if fs_proc != fs else scg_filtered_full
         
@@ -749,7 +580,7 @@ else:
         st.plotly_chart(fig, use_container_width=True)
         
         # PSD Comparison Plot
-        st.markdown("### 📡 Frequency Spectrum Analysis")
+        st.markdown("### ðŸ“¡ Frequency Spectrum Analysis")
         st.write("Comparison of Power Spectral Density (PSD) before and after preprocessing")
         
         # Calculate PSD using Welch's method
@@ -796,6 +627,9 @@ else:
                 end_idx_proc = int((start_time + window_size) * fs_proc)
                 scg_for_svmd = scg_filtered_full[start_idx_proc:end_idx_proc]
                 ecg_segment_proc = ecg_proc_full[start_idx_proc:end_idx_proc]
+                r_peaks_window = r_peaks_proc_full[
+                    (r_peaks_proc_full >= start_idx_proc) & (r_peaks_proc_full < end_idx_proc)
+                ] - start_idx_proc
                 fs_svmd = fs_proc
 
                 with st.spinner("Running SVMD..."):
@@ -809,6 +643,7 @@ else:
                         "omegas": omegas,
                         "fs_svmd": fs_svmd,
                         "ecg_segment_proc": ecg_segment_proc,
+                        "r_peaks_window": r_peaks_window,
                         "time_axis_imf": time_axis_imf,
                     }
                     st.session_state.pop("recon_result", None)
@@ -833,7 +668,7 @@ else:
 
             fig_imfs = make_subplots(rows=len(modes), cols=1, shared_xaxes=True,
                                     vertical_spacing=0.02,
-                                    subplot_titles=[f"IMF {i+1} (ω = {omegas[i]:.4f})" for i in range(len(modes))])
+                                    subplot_titles=[f"IMF {i+1} (Ï‰ = {omegas[i]:.4f})" for i in range(len(modes))])
 
             for i, mode in enumerate(modes):
                 fig_imfs.add_trace(
@@ -897,7 +732,7 @@ else:
             selected_idx = recon_result["selected_idx"]
             center_freq_hz = recon_result["center_freq_hz"]
 
-            st.markdown("### 📊 Waveform Factor Analysis")
+            st.markdown("### ðŸ“Š Waveform Factor Analysis")
             st.write(f"**Waveform Factor Mean:** {wf_mean:.4f}")
             st.write(f"**IMFs selected for reconstruction:** {len(selected_idx)} out of {len(wfs)}")
 
@@ -937,7 +772,7 @@ else:
 
             st.plotly_chart(fig_wf, use_container_width=True)
 
-            st.markdown("### 🎯 Center Frequency vs Waveform Factor")
+            st.markdown("### ðŸŽ¯ Center Frequency vs Waveform Factor")
             scatter_labels = [f"IMF {i+1}" for i in range(len(wfs))]
             fig_scatter = go.Figure()
 
@@ -996,10 +831,14 @@ else:
                 s_ao_7, envelope, smoothed_env, peaks = extract_ao_peaks(
                     s_ao_plot, fs_proc_local, prominence_factor, power=power_exp
                 )
-                
-                # Detect R peaks from ECG
-                ecg_segment = recon_result["ecg_segment_proc"]
-                r_peaks, ecg_filtered, ecg_integrated = detect_r_peaks(ecg_segment, fs_proc_local)
+
+                svmd_state = st.session_state.get("svmd_result", {})
+                r_peaks = np.asarray(svmd_state.get("r_peaks_window", np.array([])), dtype=int)
+                if r_peaks.size > 0:
+                    # Constrain AO detection to annotated ECG peak span in this window.
+                    peaks = peaks[(peaks >= r_peaks[0]) & (peaks <= r_peaks[-1])]
+                ecg_filtered = None
+                ecg_integrated = None
                 
                 # Compare intervals
                 comparison = compare_intervals(peaks, r_peaks, fs_proc_local)
@@ -1034,7 +873,7 @@ else:
             
             # Debug visualization for ECG
             if ecg_filtered is not None:
-                with st.expander("🔍 ECG Debug View", expanded=False):
+                with st.expander("ðŸ” ECG Debug View", expanded=False):
                     fig_debug = go.Figure()
                     fig_debug.add_trace(go.Scatter(
                         x=time_axis_proc,
@@ -1085,7 +924,7 @@ else:
             
             # Display comparison statistics if available
             if comparison is not None:
-                st.markdown("### 📊 AO-AO vs R-R Interval Comparison")
+                st.markdown("### ðŸ“Š AO-AO vs R-R Interval Comparison")
                 
                 col1, col2, col3, col4 = st.columns(4)
                 with col1:
@@ -1253,8 +1092,7 @@ else:
                 st.warning("Please enable 'Apply Complete Preprocessing' first.")
             else:
                 st.divider()
-                st.subheader("📊 Full Record Analysis")
-                st.info(f"Analyzing entire record ({total_duration:.1f}s) using 10-second windows...")
+                st.subheader("ðŸ“Š Full Record Analysis")
                 
                 # Initialize accumulators
                 all_ao_peaks = []
@@ -1270,7 +1108,19 @@ else:
                     scg_proc_full = apply_mti_filter(scg_proc_full)
                 
                 window_duration = 10.0  # 10 second windows
-                num_windows = int((len(scg_proc_full) / fs_proc_full) / window_duration)
+                analysis_start_idx = get_first_annotated_peak_idx(r_peaks_proc_full)
+                analysis_end_idx = get_last_annotated_peak_idx(r_peaks_proc_full, fallback_len=len(scg_proc_full))
+                analysis_start_time = analysis_start_idx / fs_proc_full
+                analysis_end_time = analysis_end_idx / fs_proc_full
+                st.info(
+                    f"Analyzing from first annotated ECG peak at {analysis_start_time:.2f}s "
+                    f"to last annotated ECG peak at {analysis_end_time:.2f}s using 10-second windows..."
+                )
+                analysis_span_sec = (analysis_end_idx - analysis_start_idx + 1) / fs_proc_full
+                num_windows = int(np.ceil(analysis_span_sec / window_duration))
+                if num_windows <= 0:
+                    st.warning("Invalid annotated ECG range for analysis.")
+                    st.stop()
                 
                 status_text = st.empty()
                 progress_bar = st.progress(0)
@@ -1279,17 +1129,17 @@ else:
                     start_time = time.time()
                     
                     for i in range(num_windows):
-                        window_start = i * window_duration
-                        window_end = window_start + window_duration
+                        window_start = analysis_start_time + i * window_duration
+                        start_idx_w = int(window_start * fs_proc_full)
+                        end_idx_w = min(int((window_start + window_duration) * fs_proc_full), analysis_end_idx + 1)
+                        if end_idx_w <= start_idx_w:
+                            continue
+                        window_end = end_idx_w / fs_proc_full
                         
                         status_text.text(f"Processing window {i+1}/{num_windows} ({window_start:.1f}s - {window_end:.1f}s)")
                         progress_bar.progress(int((i+1) / num_windows * 100))
                         
                         # Extract window
-                        start_idx_w = int(window_start * fs_proc_full)
-                        end_idx_w = int(window_end * fs_proc_full)
-                        
-                        ecg_window = ecg_proc_full[start_idx_w:end_idx_w]
                         scg_for_svmd_w = scg_proc_full[start_idx_w:end_idx_w]
                         fs_svmd = fs_proc_full
                         
@@ -1311,8 +1161,10 @@ else:
                             s_ao_w, fs_proc_full, prominence_factor, power=power_exp
                         )
                         
-                        # Detect R peaks from ECG
-                        r_peaks_w, ecg_filtered_w, ecg_integrated_w = detect_r_peaks(ecg_window, fs_proc_full)
+                        # Use annotation R peaks in this window.
+                        r_peaks_w = r_peaks_proc_full[
+                            (r_peaks_proc_full >= start_idx_w) & (r_peaks_proc_full < end_idx_w)
+                        ] - start_idx_w
                         
                         # Adjust peak indices to global time and collect
                         if len(ao_peaks_w) > 0:
@@ -1351,11 +1203,11 @@ else:
                     all_ao_intervals_times = np.array(all_ao_intervals_times)
                     all_rr_intervals_times = np.array(all_rr_intervals_times)
                     
-                    st.success(f"✅ Found {len(all_ao_peaks)} AO peaks and {len(all_r_peaks)} R peaks across entire record | ⏱️ Processing time: {elapsed_time:.2f} seconds")
+                    st.success(f"âœ… Found {len(all_ao_peaks)} AO peaks and {len(all_r_peaks)} R peaks across entire record | â±ï¸ Processing time: {elapsed_time:.2f} seconds")
 
                     if save_json_output and len(all_ao_peaks) > 0:
                         saved_file = save_peaks_to_json(all_ao_peaks, fs_proc_full, selected_record, output_folder)
-                        st.info(f"💾 AO Peaks saved locally to: {saved_file}")
+                        st.info(f"ðŸ’¾ AO Peaks saved locally to: {saved_file}")
                     
                     # Calculate comparison statistics
                     if len(all_ao_peaks) > 1 and len(all_r_peaks) > 1:
@@ -1396,7 +1248,7 @@ else:
                             
                             pairs_removed = original_count - len(all_ao_intervals)
                             
-                            st.info(f"🔧 Outlier removal: {pairs_removed} interval pairs removed (maintained equal counts)")
+                            st.info(f"ðŸ”§ Outlier removal: {pairs_removed} interval pairs removed (maintained equal counts)")
                         
                         # Use the (potentially filtered) intervals directly
                         ao_intervals_matched = all_ao_intervals
@@ -1414,7 +1266,7 @@ else:
                         std_diff = np.std(diff_intervals)
                         
                         # Display metrics
-                        st.markdown("#### 📈 Interval Comparison Statistics")
+                        st.markdown("#### ðŸ“ˆ Interval Comparison Statistics")
                         col1, col2, col3, col4 = st.columns(4)
                         
                         with col1:
@@ -1427,7 +1279,7 @@ else:
                             st.metric("Bias", f"{mean_diff:.1f} ms")
                         
                         # Time series plot with overlayed intervals
-                        st.markdown("#### ⏱️ Signals and Interval Time Series Comparison")
+                        st.markdown("#### â±ï¸ Signals and Interval Time Series Comparison")
                         
                         # Create subplot with 3 rows: ECG, SCG, and Intervals
                         fig_intervals = make_subplots(
@@ -1525,13 +1377,13 @@ else:
                         fig_intervals.update_yaxes(showgrid=True, gridcolor='rgba(200, 200, 0.3)')
                         fig_intervals.update_xaxes(title_text="Time (s)", row=3, col=1)
                         fig_intervals.update_yaxes(title_text="ECG (mV)", row=1, col=1)
-                        fig_intervals.update_yaxes(title_text="SCG (m/s²)", row=2, col=1)
+                        fig_intervals.update_yaxes(title_text="SCG (m/sÂ²)", row=2, col=1)
                         fig_intervals.update_yaxes(title_text="Interval (ms)", row=3, col=1)
                         
                         st.plotly_chart(fig_intervals, use_container_width=True)
                         
                         # Bland-Altman Plot
-                        st.markdown("#### 📊 Bland-Altman Plot")
+                        st.markdown("#### ðŸ“Š Bland-Altman Plot")
                         fig_ba_full = go.Figure()
                         
                         fig_ba_full.add_trace(go.Scatter(
@@ -1588,7 +1440,7 @@ else:
                         st.plotly_chart(fig_ba_full, use_container_width=True)
                         
                         # Correlation scatter plot
-                        st.markdown("#### 🔗 Interval Correlation")
+                        st.markdown("#### ðŸ”— Interval Correlation")
                         fig_corr_full = go.Figure()
                         
                         fig_corr_full.add_trace(go.Scatter(
@@ -1746,7 +1598,7 @@ else:
                 st.warning("Please enable 'Apply Complete Preprocessing' first.")
             else:
                 st.divider()
-                st.subheader("🔄 Batch Full Record Analysis")
+                st.subheader("ðŸ”„ Batch Full Record Analysis")
                 st.info(f"Analyzing full records for all {len(records)} records using 10-second windows...")
 
                 batch_full_results = []
@@ -1756,24 +1608,31 @@ else:
                 try:
                     if is_unhealthy:
                         labels_df = load_unhealthy_labels(base_dir)
-                        skip_seconds = unhealthy_skip_seconds or 0.0
 
                         for idx, record_name in enumerate(records, start=1):
                             status_text.text(f"Processing: {record_name} ({idx}/{len(records)})")
                             progress_bar.progress(int((idx / len(records)) * 100))
 
                             try:
-                                signals_batch, _, fs_batch = load_unhealthy_patient_data(record_name, base_dir)
+                                signals_batch, r_peaks_batch_ref, fs_batch = load_unhealthy_patient_data(record_name, base_dir)
                                 total_duration_batch = len(signals_batch) / fs_batch
                                 label_str = get_unhealthy_label_str(labels_df, record_name)
 
                                 scg_proc_batch, fs_proc_batch = resample_for_processing(signals_batch[:, 3], fs_batch, target_fs=500)
                                 ecg_proc_batch, _ = resample_for_processing(signals_batch[:, 0], fs_batch, target_fs=500)
+                                r_peaks_proc_batch = convert_peak_indices_fs(
+                                    r_peaks_batch_ref, fs_batch, fs_proc_batch, max_len=len(ecg_proc_batch)
+                                )
                                 if use_mti:
                                     scg_proc_batch = apply_mti_filter(scg_proc_batch)
 
                                 window_duration = 10.0
-                                if total_duration_batch <= skip_seconds + window_duration:
+                                first_annotated_idx = get_first_annotated_peak_idx(r_peaks_proc_batch)
+                                last_annotated_idx = get_last_annotated_peak_idx(r_peaks_proc_batch, fallback_len=len(scg_proc_batch))
+                                analysis_start_idx = first_annotated_idx
+                                analysis_end_idx = last_annotated_idx
+                                analysis_start_time = analysis_start_idx / fs_proc_batch
+                                if analysis_end_idx <= analysis_start_idx:
                                     batch_full_results.append({
                                         "Record": record_name,
                                         "Condition": label_str,
@@ -1784,7 +1643,7 @@ else:
                                         "Correlation": "N/A",
                                         "RMSE (ms)": "N/A",
                                         "MAE (ms)": "N/A",
-                                        "Status": "⚠ Skipped (duration too short)"
+                                        "Status": "âš  Skipped (invalid annotated ECG range)"
                                     })
                                     continue
 
@@ -1794,19 +1653,16 @@ else:
                                 all_ao_peaks_batch = []
                                 all_r_peaks_batch = []
 
-                                usable_duration = total_duration_batch - skip_seconds
-                                num_windows = int(usable_duration / window_duration)
+                                usable_duration = (analysis_end_idx - analysis_start_idx + 1) / fs_proc_batch
+                                num_windows = int(np.ceil(usable_duration / window_duration))
 
                                 for i in range(num_windows):
-                                    window_start = skip_seconds + i * window_duration
-                                    window_end = window_start + window_duration
-
+                                    window_start = analysis_start_time + i * window_duration
                                     start_idx_w = int(window_start * fs_proc_batch)
-                                    end_idx_w = int(window_end * fs_proc_batch)
-                                    if end_idx_w > len(scg_proc_batch):
-                                        break
+                                    end_idx_w = min(int((window_start + window_duration) * fs_proc_batch), analysis_end_idx + 1)
+                                    if end_idx_w <= start_idx_w:
+                                        continue
 
-                                    ecg_window = ecg_proc_batch[start_idx_w:end_idx_w]
                                     scg_for_svmd_w = scg_proc_batch[start_idx_w:end_idx_w]
                                     fs_svmd = fs_proc_batch
 
@@ -1820,7 +1676,9 @@ else:
                                     _, _, _, ao_peaks_w = extract_ao_peaks(
                                         s_ao_w, fs_proc_batch, prominence_factor, power=power_exp
                                     )
-                                    r_peaks_w, _, _ = detect_r_peaks(ecg_window, fs_proc_batch)
+                                    r_peaks_w = r_peaks_proc_batch[
+                                        (r_peaks_proc_batch >= start_idx_w) & (r_peaks_proc_batch < end_idx_w)
+                                    ] - start_idx_w
 
                                     if len(ao_peaks_w) > 1:
                                         ao_intervals_w = np.diff(ao_peaks_w) / fs_proc_batch * 1000
@@ -1881,7 +1739,7 @@ else:
                                         "Correlation": f"{correlation:.3f}",
                                         "RMSE (ms)": f"{rmse:.1f}",
                                         "MAE (ms)": f"{mae:.1f}",
-                                        "Status": "✓ OK"
+                                        "Status": "âœ“ OK"
                                     })
                                 else:
                                     batch_full_results.append({
@@ -1894,7 +1752,7 @@ else:
                                         "Correlation": "N/A",
                                         "RMSE (ms)": "N/A",
                                         "MAE (ms)": "N/A",
-                                        "Status": "⚠ Insufficient intervals"
+                                        "Status": "âš  Insufficient intervals"
                                     })
 
                             except Exception as e:
@@ -1908,7 +1766,7 @@ else:
                                     "Correlation": "N/A",
                                     "RMSE (ms)": "N/A",
                                     "MAE (ms)": "N/A",
-                                    "Status": "❌ Error"
+                                    "Status": "âŒ Error"
                                 })
 
                     else:
@@ -1924,9 +1782,21 @@ else:
 
                                 record_data = wfdb.rdsamp(os.path.join(db_path, record_name))
                                 signals_batch = record_data[0]
+                                ann_batch = None
+                                try:
+                                    ann_batch_obj = wfdb.rdann(os.path.join(db_path, record_name), 'atr')
+                                    ann_batch = extract_wfdb_r_peaks(ann_batch_obj)
+                                except Exception:
+                                    ann_batch = None
 
                                 scg_proc_batch, fs_proc_batch = resample_for_processing(signals_batch[:, 3], fs_batch, target_fs=500)
                                 ecg_proc_batch, _ = resample_for_processing(signals_batch[:, 0], fs_batch, target_fs=500)
+                                r_peaks_proc_batch = convert_peak_indices_fs(
+                                    np.asarray(ann_batch if ann_batch is not None else np.array([]), dtype=int),
+                                    fs_batch,
+                                    fs_proc_batch,
+                                    max_len=len(ecg_proc_batch),
+                                )
                                 if use_mti:
                                     scg_proc_batch = apply_mti_filter(scg_proc_batch)
 
@@ -1937,17 +1807,47 @@ else:
                                 all_r_peaks_batch = []
 
                                 window_duration = 10.0
-                                num_windows = int(total_duration_batch / window_duration)
+                                analysis_start_idx = get_first_annotated_peak_idx(r_peaks_proc_batch)
+                                analysis_end_idx = get_last_annotated_peak_idx(r_peaks_proc_batch, fallback_len=len(scg_proc_batch))
+                                if analysis_end_idx <= analysis_start_idx:
+                                    batch_full_results.append({
+                                        "Record": record_name,
+                                        "Duration (s)": f"{total_duration_batch:.1f}",
+                                        "AO Peaks": "N/A",
+                                        "R Peaks": "N/A",
+                                        "Intervals": "N/A",
+                                        "Correlation": "N/A",
+                                        "RMSE (ms)": "N/A",
+                                        "MAE (ms)": "N/A",
+                                        "Status": "âš  Skipped (invalid annotated ECG range)"
+                                    })
+                                    continue
+
+                                analysis_start_time = analysis_start_idx / fs_proc_batch
+                                usable_duration = (analysis_end_idx - analysis_start_idx + 1) / fs_proc_batch
+                                num_windows = int(np.ceil(usable_duration / window_duration))
+                                if num_windows <= 0:
+                                    batch_full_results.append({
+                                        "Record": record_name,
+                                        "Duration (s)": f"{total_duration_batch:.1f}",
+                                        "AO Peaks": "N/A",
+                                        "R Peaks": "N/A",
+                                        "Intervals": "N/A",
+                                        "Correlation": "N/A",
+                                        "RMSE (ms)": "N/A",
+                                        "MAE (ms)": "N/A",
+                                        "Status": "âš  Skipped (annotated range < 10s)"
+                                    })
+                                    continue
 
                                 # Process each 10s window
                                 for i in range(num_windows):
-                                    window_start = i * window_duration
-                                    window_end = window_start + window_duration
-
+                                    window_start = analysis_start_time + i * window_duration
                                     start_idx_w = int(window_start * fs_proc_batch)
-                                    end_idx_w = int(window_end * fs_proc_batch)
+                                    end_idx_w = min(int((window_start + window_duration) * fs_proc_batch), analysis_end_idx + 1)
+                                    if end_idx_w <= start_idx_w:
+                                        continue
 
-                                    ecg_window = ecg_proc_batch[start_idx_w:end_idx_w]
                                     scg_for_svmd_w = scg_proc_batch[start_idx_w:end_idx_w]
                                     fs_svmd = fs_proc_batch
 
@@ -1966,7 +1866,9 @@ else:
                                     _, _, _, ao_peaks_w = extract_ao_peaks(
                                         s_ao_w, fs_proc_batch, prominence_factor, power=power_exp
                                     )
-                                    r_peaks_w, _, _ = detect_r_peaks(ecg_window, fs_proc_batch)
+                                    r_peaks_w = r_peaks_proc_batch[
+                                        (r_peaks_proc_batch >= start_idx_w) & (r_peaks_proc_batch < end_idx_w)
+                                    ] - start_idx_w
 
                                     # Collect peaks and intervals
                                     if len(ao_peaks_w) > 1:
@@ -2031,7 +1933,7 @@ else:
                                         "Correlation": f"{correlation:.3f}",
                                         "RMSE (ms)": f"{rmse:.1f}",
                                         "MAE (ms)": f"{mae:.1f}",
-                                        "Status": "✓ OK"
+                                        "Status": "âœ“ OK"
                                     })
                                 else:
                                     batch_full_results.append({
@@ -2043,7 +1945,7 @@ else:
                                         "Correlation": "N/A",
                                         "RMSE (ms)": "N/A",
                                         "MAE (ms)": "N/A",
-                                        "Status": "⚠ Insufficient intervals"
+                                        "Status": "âš  Insufficient intervals"
                                     })
 
                             except Exception as e:
@@ -2056,7 +1958,7 @@ else:
                                     "Correlation": "N/A",
                                     "RMSE (ms)": "N/A",
                                     "MAE (ms)": "N/A",
-                                    "Status": "❌ Error"
+                                    "Status": "âŒ Error"
                                 })
 
                     status_text.text("Batch processing complete!")
@@ -2064,7 +1966,7 @@ else:
 
                     # Display results
                     st.divider()
-                    st.subheader("📋 Full Record Batch Results")
+                    st.subheader("ðŸ“‹ Full Record Batch Results")
                     st.dataframe(batch_full_results, use_container_width=True, hide_index=True)
 
                 except Exception as e:

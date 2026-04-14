@@ -21,6 +21,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRectF
 class HVDNetDataLoader:
     def __init__(self, data_dir="Data"):
         self.data_dir = data_dir
+        self.saved_peaks_dir = "Saved_Peaks"
         self.target_fs = 256  # The paper standardizes to 256 Hz 
         self.label_columns = [
             "Moderate or greater MS",
@@ -52,8 +53,46 @@ class HVDNetDataLoader:
         h, m, s = time_str.split(':')
         return int(h) * 3600 + int(m) * 60 + float(s)
 
-    def load_patient_data(self, patient_id):
-        """Loads SCG, ECG, R-Peaks, and Ground Truth for a given patient."""
+    def load_annotation_peaks(self, patient_id, annotation_source, signal_length):
+        annotation_source = (annotation_source or "ECG").upper()
+
+        if annotation_source == "AO":
+            json_path = os.path.join(self.saved_peaks_dir, f"{patient_id}_AO_Peaks.json")
+            key_name = f"{patient_id}_AO_Peaks"
+            peak_plot_axis = 'AccZ'
+            peak_label = 'AO-peaks'
+        else:
+            json_path = f"{self.data_dir}{patient_id}-ECG.json"
+            key_name = 'LARA_R_Peaks'
+            peak_plot_axis = 'ECG'
+            peak_label = 'R-peaks'
+
+        try:
+            with open(json_path, 'r') as f:
+                peak_data = json.load(f)
+
+            time_strings = peak_data.get(key_name)
+            if time_strings is None:
+                if peak_data:
+                    time_strings = next(iter(peak_data.values()))
+                else:
+                    time_strings = []
+
+            peak_seconds = [self.time_to_seconds(ts) for ts in time_strings]
+            peak_indices = [int(np.round(sec * self.target_fs)) for sec in peak_seconds]
+            peak_indices = [idx for idx in peak_indices if 0 <= idx < signal_length]
+
+            return {
+                'peak_indices': peak_indices,
+                'peak_source': annotation_source,
+                'peak_plot_axis': peak_plot_axis,
+                'peak_label': peak_label,
+            }
+        except Exception as e:
+            raise Exception(f"Failed to load {annotation_source} peaks JSON: {str(e)}")
+
+    def load_patient_data(self, patient_id, annotation_source="ECG"):
+        """Loads SCG, ECG, selected peaks annotation, and Ground Truth for a given patient."""
         results = {}
         
         # 1. Load Raw Signals (CSV)
@@ -89,25 +128,12 @@ class HVDNetDataLoader:
         except Exception as e:
             raise Exception(f"Failed to load signal CSV: {str(e)}")
 
-        # 2. Load ECG R-Peaks (JSON)
-        json_path = f"{self.data_dir}{patient_id}-ECG.json"
-        try:
-            with open(json_path, 'r') as f:
-                peak_data = json.load(f)
-            
-            time_strings = peak_data.get('LARA_R_Peaks', [])
-            peak_seconds = [self.time_to_seconds(ts) for ts in time_strings]
-            
-            # Convert seconds to indices based on the target 256Hz sampling rate
-            peak_indices = [int(np.round(sec * self.target_fs)) for sec in peak_seconds]
-            
-            # Filter out indices that might exceed the signal array length due to rounding
-            peak_indices = [idx for idx in peak_indices if idx < results['signal_length']]
-            
-            results['r_peaks_indices'] = peak_indices
-            
-        except Exception as e:
-            raise Exception(f"Failed to load R-peaks JSON: {str(e)}")
+        # 2. Load selected annotation peaks (ECG R-peaks or AO peaks)
+        peak_info = self.load_annotation_peaks(patient_id, annotation_source, results['signal_length'])
+        results['r_peaks_indices'] = peak_info['peak_indices']
+        results['peak_source'] = peak_info['peak_source']
+        results['peak_plot_axis'] = peak_info['peak_plot_axis']
+        results['peak_label'] = peak_info['peak_label']
 
         # 3. Load Ground Truth Labels
         labels_path = f"{self.data_dir}ground_truth_labels.csv"
@@ -683,6 +709,11 @@ class HVDMainWindow(QMainWindow):
         self.task_selector = QComboBox()
         self.task_selector.addItems(["Task I", "Task II", "Task III"])
         self.task_selector.currentTextChanged.connect(self.on_task_changed)
+        self.annotation_selector = QComboBox()
+        self.annotation_selector.addItems(["ECG R-peaks", "AO peaks (Saved_Peaks)"])
+        self.peak_filter_selector = QComboBox()
+        self.peak_filter_selector.addItems(["Keep all peaks", "Discard impossible peaks"])
+        self.peak_filter_selector.setToolTip("Drops peaks with inter-peak intervals outside 0.27s to 2.0s before segmentation when enabled.")
         self.step1_btn = QPushButton("Step 1: Load Data")
         self.step1_btn.clicked.connect(self.step_load_data)
         self.step2_btn = QPushButton("Step 2:\nFilter (1-30 Hz)")
@@ -732,6 +763,14 @@ class HVDMainWindow(QMainWindow):
         task_row.addWidget(QLabel("Task:"))
         task_row.addWidget(self.task_selector)
 
+        annotation_row = QHBoxLayout()
+        annotation_row.addWidget(QLabel("Annotations:"))
+        annotation_row.addWidget(self.annotation_selector)
+
+        peak_filter_row = QHBoxLayout()
+        peak_filter_row.addWidget(QLabel("Peak Filter:"))
+        peak_filter_row.addWidget(self.peak_filter_selector)
+
         class_attn_row = QHBoxLayout()
         class_attn_row.addWidget(QLabel("Condition:"))
         class_attn_row.addWidget(self.class_attn_class_selector)
@@ -754,6 +793,8 @@ class HVDMainWindow(QMainWindow):
 
         input_layout.addLayout(patient_row)
         input_layout.addLayout(task_row)
+        input_layout.addLayout(annotation_row)
+        input_layout.addLayout(peak_filter_row)
         input_layout.addWidget(self.step1_btn)
         input_layout.addWidget(self.step2_btn)
         input_layout.addWidget(self.step3_btn)
@@ -782,7 +823,7 @@ class HVDMainWindow(QMainWindow):
         # View mode and segment navigation
         nav_layout = QVBoxLayout()
         self.view_mode = QComboBox()
-        self.view_mode.addItems(["Entire Signal", "Segments (R_i to R_{i+3})"])
+        self.view_mode.addItems(["Entire Signal", "Segments (P_i to P_{i+3})"])
         self.view_mode.currentIndexChanged.connect(self.on_view_mode_changed)
 
         self.plot_stage = QComboBox()
@@ -1037,6 +1078,13 @@ class HVDMainWindow(QMainWindow):
 
         return self.patient_input.text().strip()
 
+    def get_selected_annotation_source(self):
+        if not hasattr(self, 'annotation_selector'):
+            return "ECG"
+        if self.annotation_selector.currentIndex() == 1:
+            return "AO"
+        return "ECG"
+
     def get_dataset_class_summary(self):
         if self.dataset_class_summary_cache is not None:
             return self.dataset_class_summary_cache
@@ -1181,6 +1229,7 @@ class HVDMainWindow(QMainWindow):
 
     def step_load_data(self):
         patient_id = self.get_selected_patient_id()
+        annotation_source = self.get_selected_annotation_source()
         self.console.clear()
         self.log(f"--- Step 1: Load Data for {patient_id} ---")
 
@@ -1188,15 +1237,16 @@ class HVDMainWindow(QMainWindow):
         self.current_patient_id = patient_id
         
         try:
-            data = self.loader.load_patient_data(patient_id)
+            data = self.loader.load_patient_data(patient_id, annotation_source=annotation_source)
 
             self.log("[SUCCESS] Signals Loaded & Standardized:")
             self.log(f" > Target Sampling Rate: {data['fs']} Hz")
             self.log(f" > Total Samples per axis: {data['signal_length']}")
 
-            self.log("\n[SUCCESS] R-Peaks Loaded:")
+            self.log(f"\n[SUCCESS] {data.get('peak_label', 'Peaks')} Loaded:")
             self.log(f" > Found {len(data['r_peaks_indices'])} peaks.")
             self.log(f" > First 5 Peak Indices: {data['r_peaks_indices'][:5]}")
+            self.log(f" > Source: {data.get('peak_source', annotation_source)}")
 
             self.log("\n[SUCCESS] Ground Truth Labels:")
             if isinstance(data['labels'], dict):
@@ -1269,9 +1319,22 @@ class HVDMainWindow(QMainWindow):
             self.log("\n[INFO] Please run Step 2 first.")
             return
 
-        self.log("\n--- Step 3: Build R-Peak Segments ---")
+        self.log("\n--- Step 3: Build Peak-Based Segments ---")
+        use_physio_filter = self.peak_filter_selector.currentIndex() == 1
+        source_peaks = np.asarray(self.current_data['r_peaks_indices'], dtype=int)
+        segment_peaks, discarded_count = self.filter_peaks_by_physiology(
+            source_peaks,
+            fs=self.current_data['fs'],
+            enabled=use_physio_filter,
+            min_interval_sec=0.27,
+            max_interval_sec=2.0,
+        )
+
+        self.current_data['segment_peak_indices'] = segment_peaks
+        self.current_data['segment_peak_discarded_count'] = int(discarded_count)
+
         self.segments = self.build_rpeak_segments(
-            self.current_data['r_peaks_indices'],
+            segment_peaks,
             self.current_data['signal_length']
         )
         self.preprocessed_segments = []
@@ -1282,7 +1345,14 @@ class HVDMainWindow(QMainWindow):
         self.plot_current_view()
 
         self.log("[SUCCESS] Segmentation complete.")
-        self.log(" > Segment rule: R_i to R_{i+3}")
+        self.log(" > Segment rule: P_i to P_{i+3}")
+        if use_physio_filter:
+            self.log(" > Physiological filter: ON (interval range 0.27s to 2.0s)")
+            self.log(f" > Peaks discarded as physiologically impossible: {discarded_count}")
+            self.log(f" > Peaks used for segmentation: {len(segment_peaks)} / {len(source_peaks)}")
+        else:
+            self.log(" > Physiological filter: OFF")
+            self.log(" > Peaks discarded as physiologically impossible: 0")
         self.log(f" > Total segments: {len(self.segments)}")
         self.log("Next: click 'Step 4: Z-Score + Pad/Truncate 800'.")
 
@@ -1326,7 +1396,10 @@ class HVDMainWindow(QMainWindow):
 
     def get_attention_sample_for_patient(self, patient_id, task_name):
         use_loaded_patient = self.current_patient_id == patient_id and self.current_data is not None
-        data = self.current_data if use_loaded_patient else self.loader.load_patient_data(patient_id)
+        data = self.current_data if use_loaded_patient else self.loader.load_patient_data(
+            patient_id,
+            annotation_source=self.get_selected_annotation_source(),
+        )
 
         if 'filtered_signals' not in data:
             data['filtered_signals'] = self.apply_zero_phase_butterworth(
@@ -1380,7 +1453,10 @@ class HVDMainWindow(QMainWindow):
 
     def get_all_task3_segments_for_patient(self, patient_id):
         use_loaded_patient = self.current_patient_id == patient_id and self.current_data is not None
-        data = self.current_data if use_loaded_patient else self.loader.load_patient_data(patient_id)
+        data = self.current_data if use_loaded_patient else self.loader.load_patient_data(
+            patient_id,
+            annotation_source=self.get_selected_annotation_source(),
+        )
 
         if 'filtered_signals' not in data:
             data['filtered_signals'] = self.apply_zero_phase_butterworth(
@@ -1698,7 +1774,10 @@ class HVDMainWindow(QMainWindow):
         for csv_path in csv_paths:
             patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
             try:
-                patient_data = self.loader.load_patient_data(patient_id)
+                patient_data = self.loader.load_patient_data(
+                    patient_id,
+                    annotation_source=self.get_selected_annotation_source(),
+                )
                 if not isinstance(patient_data.get('labels'), dict):
                     skipped_by_task += 1
                     continue
@@ -2056,7 +2135,10 @@ class HVDMainWindow(QMainWindow):
 
     def build_patient_inference_result(self, patient_id, task_name, model, device):
         use_loaded_patient = self.current_patient_id == patient_id and self.current_data is not None
-        data = self.current_data if use_loaded_patient else self.loader.load_patient_data(patient_id)
+        data = self.current_data if use_loaded_patient else self.loader.load_patient_data(
+            patient_id,
+            annotation_source=self.get_selected_annotation_source(),
+        )
 
         if 'filtered_signals' not in data:
             data['filtered_signals'] = self.apply_zero_phase_butterworth(
@@ -2204,7 +2286,9 @@ class HVDMainWindow(QMainWindow):
         accy = signals['AccY']
         accz = signals['AccZ']
         ecg = signals['ECG']
-        r_peaks = np.asarray(data.get('r_peaks_indices', []), dtype=int)
+        peak_indices = np.asarray(data.get('r_peaks_indices', []), dtype=int)
+        peak_label = data.get('peak_label', 'R-peaks')
+        peak_plot_axis = data.get('peak_plot_axis', 'ECG')
 
         n = data['signal_length']
         t = np.arange(n) / fs
@@ -2226,20 +2310,26 @@ class HVDMainWindow(QMainWindow):
             accz_plot.plot(t, accz, pen=pg.mkPen('#2ca02c', width=1))
         ecg_plot.plot(t, ecg, pen=pg.mkPen('#d62728', width=1))
 
-        if len(r_peaks):
-            peak_times = r_peaks / fs
-            peak_vals = ecg[r_peaks]
+        if len(peak_indices):
+            peak_times = peak_indices / fs
+            if peak_plot_axis == 'AccZ':
+                peak_plot_target = accz_plot
+                peak_signal_values = accz
+            else:
+                peak_plot_target = ecg_plot
+                peak_signal_values = ecg
+            peak_vals = peak_signal_values[peak_indices]
             for peak_time in peak_times:
-                ecg_plot.addLine(x=float(peak_time), pen=pg.mkPen((255, 255, 0, 90), width=1))
+                peak_plot_target.addLine(x=float(peak_time), pen=pg.mkPen((255, 255, 0, 90), width=1))
             r_peak_scatter = pg.ScatterPlotItem(
                 x=peak_times,
                 y=peak_vals,
                 pen=pg.mkPen((0, 0, 0), width=1),
                 brush=pg.mkBrush(255, 255, 0),
                 size=10,
-                name='R-peaks'
+                name=peak_label
             )
-            ecg_plot.addItem(r_peak_scatter)
+            peak_plot_target.addItem(r_peak_scatter)
 
         if len(t):
             initial_window_sec = min(10, t[-1])
@@ -2620,6 +2710,27 @@ class HVDMainWindow(QMainWindow):
                 })
         return segments
 
+    def filter_peaks_by_physiology(self, peak_indices, fs, enabled=False, min_interval_sec=0.27, max_interval_sec=2.0):
+        peak_indices = np.asarray(peak_indices, dtype=int)
+        if len(peak_indices) <= 1 or not enabled:
+            return peak_indices, 0
+
+        sorted_unique = np.unique(np.sort(peak_indices))
+        accepted = [int(sorted_unique[0])]
+        discarded = 0
+
+        min_interval_samples = int(np.round(min_interval_sec * fs))
+        max_interval_samples = int(np.round(max_interval_sec * fs))
+
+        for candidate in sorted_unique[1:]:
+            interval = int(candidate) - int(accepted[-1])
+            if min_interval_samples <= interval <= max_interval_samples:
+                accepted.append(int(candidate))
+            else:
+                discarded += 1
+
+        return np.asarray(accepted, dtype=int), int(discarded)
+
     def on_view_mode_changed(self, _index):
         self.current_segment_idx = 0
         self.update_navigation_controls()
@@ -2702,7 +2813,7 @@ class HVDMainWindow(QMainWindow):
             total_seg = len(self.segments)
             seg = self.segments[self.current_segment_idx]
             self.segment_info_label.setText(
-                f"Segment: {current_seg_num}/{total_seg} (R{seg['start_peak_number']}-R{seg['end_peak_number']})"
+                f"Segment: {current_seg_num}/{total_seg} (P{seg['start_peak_number']}-P{seg['end_peak_number']})"
             )
         else:
             self.segment_info_label.setText(f"Segments available: {len(self.segments)}")
@@ -2727,7 +2838,9 @@ class HVDMainWindow(QMainWindow):
         accy = signals['AccY']
         accz = signals['AccZ']
         ecg = signals['ECG']
-        r_peaks = np.asarray(self.current_data.get('r_peaks_indices', []), dtype=int)
+        peak_indices = np.asarray(self.current_data.get('r_peaks_indices', []), dtype=int)
+        peak_label = self.current_data.get('peak_label', 'R-peaks')
+        peak_plot_axis = self.current_data.get('peak_plot_axis', 'ECG')
 
         segment_mode = self.view_mode.currentIndex() == 1 and len(self.segments) > 0
 
@@ -2742,11 +2855,14 @@ class HVDMainWindow(QMainWindow):
 
             start_idx = seg['start_idx']
             end_idx = seg['end_idx']
-            seg_mask = (r_peaks >= start_idx) & (r_peaks < end_idx)
-            peak_indices_local = r_peaks[seg_mask] - start_idx
+            seg_mask = (peak_indices >= start_idx) & (peak_indices < end_idx)
+            peak_indices_local = peak_indices[seg_mask] - start_idx
             peak_indices_local = peak_indices_local[peak_indices_local < 800]
             peak_times = peak_indices_local / fs
-            peak_vals = ecg_v[peak_indices_local] if len(peak_indices_local) else np.array([])
+            if peak_plot_axis == 'AccZ':
+                peak_vals = accz_v[peak_indices_local] if len(peak_indices_local) else np.array([])
+            else:
+                peak_vals = ecg_v[peak_indices_local] if len(peak_indices_local) else np.array([])
 
             title = (
                 f"Patient {self.current_patient_id} - {stage_name}, "
@@ -2764,10 +2880,13 @@ class HVDMainWindow(QMainWindow):
             ecg_v = ecg[start_idx:end_idx]
             t = np.arange(end_idx - start_idx) / fs
 
-            seg_mask = (r_peaks >= start_idx) & (r_peaks < end_idx)
-            peak_indices_local = r_peaks[seg_mask] - start_idx
+            seg_mask = (peak_indices >= start_idx) & (peak_indices < end_idx)
+            peak_indices_local = peak_indices[seg_mask] - start_idx
             peak_times = peak_indices_local / fs
-            peak_vals = ecg_v[peak_indices_local] if len(peak_indices_local) else np.array([])
+            if peak_plot_axis == 'AccZ':
+                peak_vals = accz_v[peak_indices_local] if len(peak_indices_local) else np.array([])
+            else:
+                peak_vals = ecg_v[peak_indices_local] if len(peak_indices_local) else np.array([])
 
             title = (
                 f"Patient {self.current_patient_id} - {stage_name}, "
@@ -2782,8 +2901,14 @@ class HVDMainWindow(QMainWindow):
             accz_v = accz
             ecg_v = ecg
 
-            peak_times = r_peaks / fs if len(r_peaks) else np.array([])
-            peak_vals = ecg[r_peaks] if len(r_peaks) else np.array([])
+            peak_times = peak_indices / fs if len(peak_indices) else np.array([])
+            if len(peak_indices):
+                if peak_plot_axis == 'AccZ':
+                    peak_vals = accz[peak_indices]
+                else:
+                    peak_vals = ecg[peak_indices]
+            else:
+                peak_vals = np.array([])
 
             title = f"Patient {self.current_patient_id} - {stage_name}, Entire Signal"
             show_peak_lines = False
@@ -2797,9 +2922,10 @@ class HVDMainWindow(QMainWindow):
         self.ecg_plot.plot(t, ecg_v, pen=pg.mkPen('#d62728', width=1))
 
         if len(peak_times):
+            peak_plot_target = self.accz_plot if peak_plot_axis == 'AccZ' else self.ecg_plot
             if show_peak_lines:
                 for peak_time in peak_times:
-                    self.ecg_plot.addLine(x=float(peak_time), pen=pg.mkPen((255, 255, 0, 90), width=1))
+                    peak_plot_target.addLine(x=float(peak_time), pen=pg.mkPen((255, 255, 0, 90), width=1))
 
             r_peak_scatter = pg.ScatterPlotItem(
                 x=peak_times,
@@ -2807,9 +2933,9 @@ class HVDMainWindow(QMainWindow):
                 pen=pg.mkPen((0, 0, 0), width=1),
                 brush=pg.mkBrush(255, 255, 0),
                 size=10,
-                name='R-peaks'
+                name=peak_label
             )
-            self.ecg_plot.addItem(r_peak_scatter)
+            peak_plot_target.addItem(r_peak_scatter)
 
         if len(t):
             initial_window_sec = min(10, t[-1])
