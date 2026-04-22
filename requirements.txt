@@ -10,6 +10,7 @@ torchvision>=0.11.0
 torchaudio>=0.10.0
 
 # GUI
+PyQt5>=5.15.0
 PyQt6>=6.0.0
 pyqtgraph>=0.12.0
 

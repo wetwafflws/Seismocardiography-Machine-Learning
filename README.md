@@ -45,6 +45,7 @@ Required packages:
 - pandas
 - numpy
 - scipy
+- PyQt5 (for inference-only desktop app)
 - PyQt6 (for GUI)
 - Streamlit (for web interface)
 - pyqtgraph (for plotting)
@@ -55,6 +56,7 @@ Required packages:
 ```
 SCG_MachineLearning/
 ├── machinelearning.py          # Main ML pipeline and GUI application
+├── pyqt5_hvdnet_inference.py   # Inference-only PyQt5 app (no training)
 ├── TA_SVMD.py                  # Streamlit data viewer and signal processing
 ├── hvdnet_task_i_1.pt          # Pre-trained model for Task I
 ├── hvdnet_task_ii_1.pt         # Pre-trained model for Task II
@@ -111,7 +113,18 @@ HVDNetDataLoader(data_dir="Data")
 python machinelearning.py
 ```
 
-### Option 2: Streamlit Web Interface
+### Option 2: PyQt5 Inference-Only Application
+```bash
+python pyqt5_hvdnet_inference.py
+```
+
+This app only performs:
+- model checkpoint loading
+- feedforward inference
+- signal and attention visualization
+- single-patient and batch inference export
+
+### Option 3: Streamlit Web Interface
 ```bash
 streamlit run TA_SVMD.py
 ```

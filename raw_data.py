@@ -12,6 +12,7 @@ Packet format:
 import sys
 import struct
 import csv
+import time
 import serial
 import serial.tools.list_ports
 from collections import deque
@@ -45,17 +46,19 @@ def xor_checksum(data: bytes) -> int:
 def parse_packets(buf: bytearray):
     """
     Consume as many complete packets from buf as possible.
-    Returns (scg_samples, beat_timestamps, remaining_buf)
+    Returns (scg_samples, beat_timestamps, remaining_buf, parse_errors)
       scg_samples      : list of (timestamp_ms, x, y, z)
       beat_timestamps  : list of timestamp_ms
     """
     scg_samples = []
     beat_timestamps = []
+    parse_errors = 0
 
     while len(buf) >= BEAT_PKT_LEN:
         # Re-sync: scan for magic byte
         if buf[0] != MAGIC:
             buf.pop(0)
+            parse_errors += 1
             continue
 
         if len(buf) < 2:
@@ -73,6 +76,7 @@ def parse_packets(buf: bytearray):
                 scg_samples.append((ts, x, y, z))
             else:
                 buf.pop(0)
+                parse_errors += 1
                 continue
             del buf[:SCG_PKT_LEN]
 
@@ -86,20 +90,22 @@ def parse_packets(buf: bytearray):
                 beat_timestamps.append(ts)
             else:
                 buf.pop(0)
+                parse_errors += 1
                 continue
             del buf[:BEAT_PKT_LEN]
 
         else:
             # Unknown type — drop magic byte and re-sync
             buf.pop(0)
+            parse_errors += 1
 
-    return scg_samples, beat_timestamps, buf
+    return scg_samples, beat_timestamps, buf, parse_errors
 
 
 # ─── Serial Reader Thread ─────────────────────────────────────────────────────
 
 class SerialReader(QObject):
-    data_ready  = pyqtSignal(list, list)   # (scg_samples, beat_timestamps)
+    data_ready  = pyqtSignal(list, list, int)   # (scg_samples, beat_timestamps, parse_errors)
     error       = pyqtSignal(str)
 
     def __init__(self, port: str, baud: int = 115200):
@@ -109,6 +115,7 @@ class SerialReader(QObject):
         self._running = False
         self._ser   = None
         self._buf   = bytearray()
+        self._parse_errors_pending = 0
 
     def start(self):
         try:
@@ -130,9 +137,12 @@ class SerialReader(QObject):
                 chunk = self._ser.read(256)
                 if chunk:
                     self._buf.extend(chunk)
-                    scg, beats, self._buf = parse_packets(self._buf)
+                    scg, beats, self._buf, parse_errors = parse_packets(self._buf)
+                    if parse_errors:
+                        self._parse_errors_pending += parse_errors
                     if scg or beats:
-                        self.data_ready.emit(scg, beats)
+                        self.data_ready.emit(scg, beats, self._parse_errors_pending)
+                        self._parse_errors_pending = 0
             except serial.SerialException as e:
                 self.error.emit(str(e))
                 break
@@ -297,10 +307,16 @@ class MainWindow(QMainWindow):
         self._scg_y = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
         self._scg_z = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
         self._scg_ts = deque([0] * WINDOW_N, maxlen=WINDOW_N)
+        self._scg_host_ts = deque([0] * WINDOW_N, maxlen=WINDOW_N)
         self._beat_ts: list[int] = []          # all beat timestamps (ms)
+        self._beat_host_ts: list[int] = []
         self._beat_intervals: deque = deque(maxlen=BPM_HISTORY)
         self._last_beat_ts: int | None = None
+        self._last_beat_host_ts: int | None = None
+        self._host_sample_clock_ms: float | None = None
+        self._use_host_time_axis = False
         self._sample_count = 0
+        self._parse_error_count = 0
         self._t_axis = np.linspace(-WINDOW_SECS, 0, WINDOW_N)
         self._plot_dirty = False
 
@@ -505,6 +521,11 @@ class MainWindow(QMainWindow):
         self._filter_checkbox.toggled.connect(self._on_filter_toggled)
         layout.addWidget(self._filter_checkbox)
 
+        self._timebase_checkbox = QCheckBox("USE PC TIME AXIS")
+        self._timebase_checkbox.setChecked(False)
+        self._timebase_checkbox.toggled.connect(self._on_timebase_toggled)
+        layout.addWidget(self._timebase_checkbox)
+
         # ── Clear button ──────────────────────────────────────────────────────
         clear_btn = QPushButton("CLEAR PLOTS")
         clear_btn.clicked.connect(self._clear_data)
@@ -597,10 +618,22 @@ class MainWindow(QMainWindow):
         self._filter_enabled = checked
         self._reset_filter_state()
 
+    def _on_timebase_toggled(self, checked: bool):
+        self._use_host_time_axis = checked
+        self._plot_dirty = True
+
     # ── Data ingestion ────────────────────────────────────────────────────────
 
-    def _on_data(self, scg_samples: list, beat_timestamps: list):
+    def _on_data(self, scg_samples: list, beat_timestamps: list, parse_errors: int):
+        self._parse_error_count += int(parse_errors)
+        sample_dt_ms = 1000.0 / SAMPLE_RATE
+
         for ts, x, y, z in scg_samples:
+            if self._host_sample_clock_ms is None:
+                self._host_sample_clock_ms = time.monotonic() * 1000.0
+            else:
+                self._host_sample_clock_ms += sample_dt_ms
+
             x_counts = raw_packet_int16_to_adc_counts(x)
             y_counts = raw_packet_int16_to_adc_counts(y)
             z_counts = raw_packet_int16_to_adc_counts(z)
@@ -613,6 +646,7 @@ class MainWindow(QMainWindow):
                 x_g, y_g, z_g = self._apply_filter_sample(x_g, y_g, z_g)
 
             self._scg_ts.append(int(ts))
+            self._scg_host_ts.append(int(self._host_sample_clock_ms))
             self._scg_x.append(x_g)
             self._scg_y.append(y_g)
             self._scg_z.append(z_g)
@@ -634,6 +668,9 @@ class MainWindow(QMainWindow):
 
         for ts in beat_timestamps:
             self._beat_ts.append(ts)
+            host_beat_ts = int(time.monotonic() * 1000.0)
+            self._beat_host_ts.append(host_beat_ts)
+            self._last_beat_host_ts = host_beat_ts
             if self._last_beat_ts is not None:
                 interval_ms = ts - self._last_beat_ts
                 if 300 < interval_ms < 2000:   # sanity: 30–200 BPM
@@ -760,7 +797,13 @@ class MainWindow(QMainWindow):
         if valid_n < 2:
             return
 
-        ts_valid = np.array(list(self._scg_ts)[-valid_n:], dtype=np.int64)
+        if self._use_host_time_axis:
+            ts_valid = np.array(list(self._scg_host_ts)[-valid_n:], dtype=np.int64)
+            beat_ts_source = self._beat_host_ts
+        else:
+            ts_valid = np.array(list(self._scg_ts)[-valid_n:], dtype=np.int64)
+            beat_ts_source = self._beat_ts
+
         t_axis = (ts_valid - ts_valid[-1]).astype(np.float32) / 1000.0
 
         arrays = [
@@ -779,10 +822,10 @@ class MainWindow(QMainWindow):
                 pw.removeItem(line)
             self._beat_lines[i].clear()
 
-            if self._last_beat_ts is not None and self._sample_count > 0:
+            if beat_ts_source and self._sample_count > 0:
                 # Anchor beat ages to the live SCG clock so beat markers scroll continuously.
-                now_ts = self._scg_ts[-1]
-                for b_ts in self._beat_ts[-20:]:   # only last 20 beats
+                now_ts = int(ts_valid[-1])
+                for b_ts in beat_ts_source[-20:]:   # only last 20 beats
                     age_s = (now_ts - b_ts) / 1000.0
                     if 0 <= age_s <= WINDOW_SECS:
                         t_pos = -age_s
@@ -795,17 +838,21 @@ class MainWindow(QMainWindow):
                         self._beat_lines[i].append(line)
 
     def _refresh_segment_plot(self):
-        if len(self._beat_ts) < 2:
+        beat_ts_source = self._beat_host_ts if self._use_host_time_axis else self._beat_ts
+        if len(beat_ts_source) < 2:
             for curve in self._segment_curves:
                 curve.setData([], [])
             return
 
-        start_ts = self._beat_ts[-2]
-        end_ts = self._beat_ts[-1]
+        start_ts = beat_ts_source[-2]
+        end_ts = beat_ts_source[-1]
         if end_ts <= start_ts:
             return
 
-        ts = np.array(self._scg_ts, dtype=np.int64)
+        if self._use_host_time_axis:
+            ts = np.array(self._scg_host_ts, dtype=np.int64)
+        else:
+            ts = np.array(self._scg_ts, dtype=np.int64)
         mask = (ts >= start_ts) & (ts <= end_ts)
         if np.count_nonzero(mask) < 2:
             for curve in self._segment_curves:
@@ -828,6 +875,7 @@ class MainWindow(QMainWindow):
 
     def _refresh_stats(self):
         self._stat_beats.setText(str(len(self._beat_ts)))
+        self._stat_lost.setText(str(self._parse_error_count))
 
         if len(self._beat_intervals) >= 2:
             avg_interval = np.mean(self._beat_intervals)
@@ -845,13 +893,19 @@ class MainWindow(QMainWindow):
         self._scg_y = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
         self._scg_z = deque([0.0] * WINDOW_N, maxlen=WINDOW_N)
         self._scg_ts = deque([0] * WINDOW_N, maxlen=WINDOW_N)
+        self._scg_host_ts = deque([0] * WINDOW_N, maxlen=WINDOW_N)
         self._reset_filter_state()
         self._beat_ts.clear()
+        self._beat_host_ts.clear()
         self._beat_intervals.clear()
         self._last_beat_ts = None
+        self._last_beat_host_ts = None
+        self._host_sample_clock_ms = None
         self._sample_count = 0
+        self._parse_error_count = 0
         self._bpm_label.setText("--")
         self._stat_beats.setText("0")
+        self._stat_lost.setText("0")
         for curve in self._segment_curves:
             curve.setData([], [])
 
