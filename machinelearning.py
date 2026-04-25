@@ -6,7 +6,6 @@ import threading
 import numpy as np
 import pandas as pd
 from scipy import signal
-import pyqtgraph as pg
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,9 +13,13 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import KFold, train_test_split, StratifiedKFold
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
 import scipy.ndimage
-from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
+from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QComboBox, QTabWidget, QGridLayout, QScrollArea, QSizePolicy)
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QRectF
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF
+
+# Ensure pyqtgraph uses the same Qt binding as the app.
+os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
+import pyqtgraph as pg
 
 class HVDNetDataLoader:
     def __init__(self, data_dir="Data"):
@@ -682,7 +685,7 @@ class HVDMainWindow(QMainWindow):
 
         controls_scroll = QScrollArea()
         controls_scroll.setWidgetResizable(True)
-        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        controls_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
 
         controls_container = QWidget()
         left_layout = QVBoxLayout(controls_container)
@@ -704,7 +707,7 @@ class HVDMainWindow(QMainWindow):
         input_layout.setSpacing(6)
         self.patient_input = QComboBox()
         self.patient_input.setMinimumWidth(180)
-        self.patient_input.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.patient_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.patient_input.setToolTip("Select a patient from the available cleaned files")
         self.task_selector = QComboBox()
         self.task_selector.addItems(["Task I", "Task II", "Task III"])
@@ -745,11 +748,11 @@ class HVDMainWindow(QMainWindow):
         self.cm_btn.clicked.connect(self.step_generate_confusion_matrix)
         self.class_attn_class_selector = QComboBox()
         self.class_attn_class_selector.setMinimumWidth(120)
-        self.class_attn_class_selector.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.class_attn_class_selector.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.class_attn_samples_input = QLineEdit("50")
         self.class_attn_samples_input.setMinimumWidth(60)
         self.class_attn_samples_input.setMaximumWidth(72)
-        self.class_attn_samples_input.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.class_attn_samples_input.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.class_attn_btn = QPushButton("Class Mean\nAttention")
         self.class_attn_btn.clicked.connect(self.step_generate_class_attention_maps)
         self.save_model_btn = QPushButton("Save Trained\nModel")
@@ -788,7 +791,7 @@ class HVDMainWindow(QMainWindow):
         for btn in all_control_buttons:
             if btn is None:
                 continue
-            btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
             btn.setMinimumHeight(44)
 
         input_layout.addLayout(patient_row)
@@ -832,17 +835,17 @@ class HVDMainWindow(QMainWindow):
 
         self.prev_segment_btn = QPushButton("Previous Segment")
         self.prev_segment_btn.clicked.connect(self.show_previous_segment)
-        self.prev_segment_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.prev_segment_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.prev_segment_btn.setMinimumHeight(36)
 
         self.next_segment_btn = QPushButton("Next Segment")
         self.next_segment_btn.clicked.connect(self.show_next_segment)
-        self.next_segment_btn.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+        self.next_segment_btn.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.next_segment_btn.setMinimumHeight(36)
 
         self.segment_info_label = QLabel("Segment: N/A")
         self.segment_info_label.setWordWrap(True)
-        self.segment_info_label.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self.segment_info_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
 
         view_row = QHBoxLayout()
         view_row.addWidget(QLabel("View:"))
@@ -2992,4 +2995,4 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     window = HVDMainWindow()
     window.show()
-    sys.exit(app.exec())
+    sys.exit(app.exec_())
