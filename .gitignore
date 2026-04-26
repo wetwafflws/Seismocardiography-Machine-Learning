@@ -24,5 +24,9 @@ ENV/
 .DS_Store
 Thumbs.db
 
+# uv/project metadata
+*.toml
+*.lock
+*.python-version
 # PyTorch models (optional - uncomment if you want to exclude)
 # *.pt

@@ -3,9 +3,12 @@ import json
 import os
 import glob
 import threading
+import time
 import numpy as np
 import pandas as pd
 from scipy import signal
+# Keeps execution on MPS when possible and falls back only unsupported ops.
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -20,6 +23,20 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF
 # Ensure pyqtgraph uses the same Qt binding as the app.
 os.environ.setdefault("PYQTGRAPH_QT_LIB", "PyQt5")
 import pyqtgraph as pg
+
+
+def get_best_torch_device():
+    """Prefer Apple Silicon MPS, then CUDA, then CPU."""
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+def move_tensor_to_device(tensor, device):
+    """Use non_blocking transfer only where it is supported."""
+    return tensor.to(device, non_blocking=(device.type == "cuda"))
 
 class HVDNetDataLoader:
     def __init__(self, data_dir="Data"):
@@ -383,7 +400,7 @@ class HVDNet(nn.Module):
 
 
 class TrainingWorker(QThread):
-    epoch_update = pyqtSignal(int, int, float, float, float, float)
+    epoch_update = pyqtSignal(int, int, float, float, float, float, float, float)
     log_update = pyqtSignal(str)
     test_update = pyqtSignal(float, float)
     finished_update = pyqtSignal(object)
@@ -437,10 +454,10 @@ class TrainingWorker(QThread):
         total = 0
         with torch.no_grad():
             for batch_x, batch_y, batch_z, labels in loader:
-                batch_x = batch_x.to(device)
-                batch_y = batch_y.to(device)
-                batch_z = batch_z.to(device)
-                labels = labels.to(device)
+                batch_x = move_tensor_to_device(batch_x, device)
+                batch_y = move_tensor_to_device(batch_y, device)
+                batch_z = move_tensor_to_device(batch_z, device)
+                labels = move_tensor_to_device(labels, device)
                 if self.multi_label:
                     labels = labels.float()
 
@@ -461,9 +478,12 @@ class TrainingWorker(QThread):
 
     def run(self):
         try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = get_best_torch_device()
             self.log_update.emit(f"Training on device: {device}")
             self.log_update.emit(f"Epochs: {self.num_epochs}, Batch Size: {self.batch_size}")
+            total_epoch_steps = self.n_splits * self.num_epochs
+            completed_epoch_steps = 0
+            epoch_durations = []
 
             labels_np = self.label_tensor.cpu().numpy()
             all_indices = np.arange(len(labels_np))
@@ -570,6 +590,7 @@ class TrainingWorker(QThread):
 
                 for epoch in range(self.num_epochs):
                     self.wait_if_paused()
+                    epoch_start = time.perf_counter()
                     model.train()
                     running_loss = 0.0
                     correct_predictions = 0
@@ -577,10 +598,10 @@ class TrainingWorker(QThread):
 
                     for batch_x, batch_y, batch_z, labels in train_loader:
                         self.wait_if_paused()
-                        batch_x = batch_x.to(device)
-                        batch_y = batch_y.to(device)
-                        batch_z = batch_z.to(device)
-                        labels = labels.to(device)
+                        batch_x = move_tensor_to_device(batch_x, device)
+                        batch_y = move_tensor_to_device(batch_y, device)
+                        batch_z = move_tensor_to_device(batch_z, device)
+                        labels = move_tensor_to_device(labels, device)
                         if self.multi_label:
                             labels = labels.float()
 
@@ -603,13 +624,28 @@ class TrainingWorker(QThread):
                     train_loss = running_loss / max(total_samples, 1)
                     train_acc = 100.0 * correct_predictions / max(total_samples, 1)
                     val_loss, val_acc = self.evaluate_loader(model, criterion, val_loader, device)
+                    epoch_seconds = time.perf_counter() - epoch_start
+
+                    completed_epoch_steps += 1
+                    epoch_durations.append(epoch_seconds)
+                    avg_epoch_seconds = float(np.mean(epoch_durations))
+                    eta_seconds = avg_epoch_seconds * max(total_epoch_steps - completed_epoch_steps, 0)
 
                     if val_loss < best_val_loss:
                         best_val_loss = val_loss
                         best_fold = fold_idx
                         best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-                    self.epoch_update.emit(fold_idx, epoch + 1, train_loss, train_acc, val_loss, val_acc)
+                    self.epoch_update.emit(
+                        fold_idx,
+                        epoch + 1,
+                        train_loss,
+                        train_acc,
+                        val_loss,
+                        val_acc,
+                        epoch_seconds,
+                        eta_seconds,
+                    )
 
             if best_state_dict is None:
                 raise RuntimeError("Cross-validation did not produce a valid best model.")
@@ -1512,9 +1548,9 @@ class HVDMainWindow(QMainWindow):
         model.eval()
         with torch.no_grad():
             logits, _ = model(
-                patient_data['x_batch'].to(device),
-                patient_data['y_batch'].to(device),
-                patient_data['z_batch'].to(device),
+                move_tensor_to_device(patient_data['x_batch'], device),
+                move_tensor_to_device(patient_data['y_batch'], device),
+                move_tensor_to_device(patient_data['z_batch'], device),
             )
             segment_probabilities = torch.sigmoid(logits).cpu().numpy()
 
@@ -1940,7 +1976,15 @@ class HVDMainWindow(QMainWindow):
         except Exception as e:
             self.log(f"[ERROR] Training setup failed: {str(e)}")
 
-    def on_training_epoch_update(self, fold, epoch, train_loss, train_acc, val_loss, val_acc):
+    def format_seconds(self, seconds):
+        seconds = max(0, int(round(float(seconds))))
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours > 0:
+            return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+        return f"{minutes:02d}:{secs:02d}"
+
+    def on_training_epoch_update(self, fold, epoch, train_loss, train_acc, val_loss, val_acc, epoch_seconds, eta_seconds):
         step = len(self.epoch_steps) + 1
         self.epoch_steps.append(step)
         self.train_epochs.append(epoch)
@@ -1954,10 +1998,13 @@ class HVDMainWindow(QMainWindow):
         self.acc_train_curve.setData(self.epoch_steps, self.train_accuracies)
         self.acc_val_curve.setData(self.epoch_steps, self.val_accuracies)
 
+        epoch_time_text = self.format_seconds(epoch_seconds)
+        eta_text = self.format_seconds(eta_seconds)
         self.log(
             f"Fold [{fold}/5] Epoch [{epoch}/100] | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "
-            f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2f}%"
+            f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2f}% | "
+            f"Epoch Time: {epoch_time_text} | ETA: {eta_text}"
         )
 
     def on_test_metrics_update(self, test_loss, test_acc):
@@ -2185,7 +2232,9 @@ class HVDMainWindow(QMainWindow):
                     segment,
                 )
                 logits, (attn_x, attn_y, attn_z) = model(
-                    x_tensor.to(device), y_tensor.to(device), z_tensor.to(device)
+                    move_tensor_to_device(x_tensor, device),
+                    move_tensor_to_device(y_tensor, device),
+                    move_tensor_to_device(z_tensor, device),
                 )
 
                 segment_probabilities = torch.sigmoid(logits).squeeze(0).cpu().numpy()
@@ -2351,7 +2400,7 @@ class HVDMainWindow(QMainWindow):
             self.log("[INFO] Select a patient from the dropdown first.")
             return
         try:
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = get_best_torch_device()
             self.hvdnet_model.to(device)
             self.hvdnet_model.eval()
 
@@ -2453,7 +2502,7 @@ class HVDMainWindow(QMainWindow):
                 shuffle=False,
             )
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = get_best_torch_device()
             self.hvdnet_model.to(device)
             self.hvdnet_model.eval()
 
@@ -2461,7 +2510,11 @@ class HVDMainWindow(QMainWindow):
             targets = []
             with torch.no_grad():
                 for bx, by, bz, bl in test_loader:
-                    logits, _ = self.hvdnet_model(bx.to(device), by.to(device), bz.to(device))
+                    logits, _ = self.hvdnet_model(
+                        move_tensor_to_device(bx, device),
+                        move_tensor_to_device(by, device),
+                        move_tensor_to_device(bz, device),
+                    )
                     if is_multilabel:
                         pred = (torch.sigmoid(logits) > 0.5).float().cpu().numpy()
                         preds.append(pred)
@@ -2575,9 +2628,9 @@ class HVDMainWindow(QMainWindow):
                     if int(label.item()) != int(target_class_idx):
                         continue
 
-                x_input = x.unsqueeze(0).to(device)
-                y_input = y.unsqueeze(0).to(device)
-                z_input = z.unsqueeze(0).to(device)
+                x_input = move_tensor_to_device(x.unsqueeze(0), device)
+                y_input = move_tensor_to_device(y.unsqueeze(0), device)
+                z_input = move_tensor_to_device(z.unsqueeze(0), device)
 
                 _, (attn_x, attn_y, attn_z) = model(x_input, y_input, z_input)
 
@@ -2632,7 +2685,7 @@ class HVDMainWindow(QMainWindow):
             x_test, y_test, z_test, y_true, class_names = self.get_task_test_split_tensors(task_name)
             test_dataset = TensorDataset(x_test, y_test, z_test, y_true)
 
-            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            device = get_best_torch_device()
             self.hvdnet_model.to(device)
             self.hvdnet_model.eval()
 
