@@ -428,6 +428,164 @@ def apply_mti_filter(raw_signal):
     
     return y_smoothed
 
+def autocorr_periodicity_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, max_hr_bpm=180,
+                             min_peak_prominence=0.03, base_threshold=0.25):
+    """
+    Segment-wise periodicity SQA using normalized autocorrelation peaks.
+
+    Metric per segment: strongest autocorrelation peak in a physiological lag range,
+    normalized by zero-lag autocorrelation.
+    """
+    x = np.asarray(signal_in, dtype=float).flatten()
+    n = len(x)
+    if n == 0 or fs <= 0:
+        return {
+            "segment_starts": np.array([]),
+            "segment_ends": np.array([]),
+            "peak_ratios": np.array([]),
+            "bad_mask": np.array([], dtype=bool),
+            "threshold": float(base_threshold),
+        }
+
+    seg_len = max(1, int(segment_seconds * fs))
+    seg_starts = np.arange(0, n, seg_len)
+    seg_ends = np.minimum(seg_starts + seg_len, n)
+
+    lag_min = int(fs * (60.0 / max_hr_bpm))
+    lag_max = int(fs * (60.0 / min_hr_bpm))
+    lag_min = max(1, lag_min)
+
+    peak_ratios = []
+    seg_rms = []
+    seg_diff_rms = []
+    seg_ptp = []
+    for s, e in zip(seg_starts, seg_ends):
+        seg = x[s:e]
+        if len(seg) < max(16, lag_max + 2):
+            peak_ratios.append(np.nan)
+            seg_rms.append(np.nan)
+            seg_diff_rms.append(np.nan)
+            seg_ptp.append(np.nan)
+            continue
+
+        seg_det = signal.detrend(seg)
+        seg_rms.append(float(np.sqrt(np.mean(seg_det**2))))
+        seg_diff_rms.append(float(np.sqrt(np.mean(np.diff(seg_det)**2))))
+        seg_ptp.append(float(np.ptp(seg_det)))
+
+        seg_std = np.std(seg_det)
+        if seg_std < 1e-10:
+            peak_ratios.append(0.0)
+            continue
+        seg_norm = (seg_det - np.mean(seg_det)) / seg_std
+
+        ac = np.correlate(seg_norm, seg_norm, mode="full")
+        ac = ac[len(seg_norm)-1:]
+        if ac[0] <= 1e-10:
+            peak_ratios.append(0.0)
+            continue
+        ac_norm = ac / ac[0]
+
+        lag_hi = min(lag_max, len(ac_norm) - 1)
+        if lag_min >= lag_hi:
+            peak_ratios.append(np.nan)
+            continue
+
+        ac_search = ac_norm[lag_min:lag_hi + 1]
+        peaks, props = find_peaks(
+            ac_search,
+            prominence=min_peak_prominence,
+            distance=max(1, int(0.25 * fs)),
+        )
+
+        if len(peaks) == 0:
+            peak_ratios.append(0.0)
+        else:
+            heights = ac_search[peaks]
+            peak_ratios.append(float(np.max(heights)))
+
+    peak_ratios = np.asarray(peak_ratios, dtype=float)
+    seg_rms = np.asarray(seg_rms, dtype=float)
+    seg_diff_rms = np.asarray(seg_diff_rms, dtype=float)
+    seg_ptp = np.asarray(seg_ptp, dtype=float)
+
+    def robust_high_mask(values, mad_mult=5.0):
+        vals = np.asarray(values, dtype=float)
+        valid_vals = vals[np.isfinite(vals)]
+        if len(valid_vals) == 0:
+            return np.zeros(len(vals), dtype=bool), np.nan
+
+        med = float(np.median(valid_vals))
+        mad = float(np.median(np.abs(valid_vals - med)))
+        if mad < 1e-12:
+            thr = med * 3.0 if med > 0 else 1e-6
+        else:
+            thr = med + mad_mult * mad
+
+        return vals > thr, float(thr)
+
+    valid = peak_ratios[np.isfinite(peak_ratios)]
+    if len(valid) > 0:
+        median_val = float(np.median(valid))
+        mad = float(np.median(np.abs(valid - median_val)))
+        robust_thr = median_val - 1.5 * mad
+        robust_thr = float(np.clip(robust_thr, 0.05, 0.95))
+        threshold = max(float(base_threshold), robust_thr)
+    else:
+        threshold = float(base_threshold)
+
+    periodicity_bad = np.isnan(peak_ratios) | (peak_ratios < threshold)
+
+    rms_bad, rms_thr = robust_high_mask(seg_rms, mad_mult=5.0)
+    diff_bad, diff_thr = robust_high_mask(seg_diff_rms, mad_mult=5.0)
+    ptp_bad, ptp_thr = robust_high_mask(seg_ptp, mad_mult=6.0)
+
+    artifact_votes = rms_bad.astype(int) + diff_bad.astype(int) + ptp_bad.astype(int)
+    artifact_bad = artifact_votes >= 2
+
+    valid_ptp = seg_ptp[np.isfinite(seg_ptp)]
+    if len(valid_ptp) > 0:
+        ptp_p99 = float(np.percentile(valid_ptp, 99))
+        ptp_med = float(np.median(valid_ptp))
+        extreme_ptp_bad = seg_ptp > max(ptp_p99, 4.0 * ptp_med)
+    else:
+        extreme_ptp_bad = np.zeros(len(seg_ptp), dtype=bool)
+
+    bad_mask = periodicity_bad | artifact_bad | extreme_ptp_bad
+
+    # Bridge isolated "good" segment between bad neighbors so large bursts stay contiguous.
+    if len(bad_mask) >= 3:
+        for idx in range(1, len(bad_mask) - 1):
+            if (not bad_mask[idx]) and bad_mask[idx - 1] and bad_mask[idx + 1]:
+                bad_mask[idx] = True
+
+    return {
+        "segment_starts": seg_starts,
+        "segment_ends": seg_ends,
+        "peak_ratios": peak_ratios,
+        "bad_mask": bad_mask,
+        "threshold": threshold,
+        "periodicity_bad": periodicity_bad,
+        "artifact_bad": artifact_bad,
+        "feature_thresholds": {
+            "rms": rms_thr,
+            "diff_rms": diff_thr,
+            "ptp": ptp_thr,
+        },
+    }
+
+def build_sample_bad_mask(signal_len, sqa_result):
+    """Broadcast segment-level bad labels into sample-level boolean mask."""
+    sample_bad = np.zeros(signal_len, dtype=bool)
+    seg_starts = sqa_result.get("segment_starts", [])
+    seg_ends = sqa_result.get("segment_ends", [])
+    bad_mask = sqa_result.get("bad_mask", [])
+
+    for s, e, is_bad in zip(seg_starts, seg_ends, bad_mask):
+        sample_bad[int(s):int(e)] = bool(is_bad)
+
+    return sample_bad
+
 # ==========================================
 # 3. WAVEFORM FACTOR & RECONSTRUCTION
 # ==========================================
@@ -630,6 +788,42 @@ else:
         use_mti = st.checkbox(
             "Apply Complete Preprocessing (MTI, Detrend, Median)",
             value=True
+        )
+
+        st.divider()
+        st.subheader("SQA: Periodicity (Autocorrelation)")
+        show_sqa_overlay = st.checkbox(
+            "Highlight low-quality SCG segments",
+            value=True,
+            help="Applies only to Full Record Analysis. Bad segments are shown in red.",
+        )
+        sqa_segment_seconds = st.slider(
+            "SQA Segment Length (s)",
+            min_value=3,
+            max_value=5,
+            value=4,
+            step=1,
+        )
+        sqa_peak_threshold = st.slider(
+            "Minimum autocorr peak ratio",
+            min_value=0.05,
+            max_value=0.80,
+            value=0.25,
+            step=0.01,
+            help="Peak ratio is first major periodic autocorr peak relative to zero-lag peak.",
+        )
+        exclude_bad_windows = st.checkbox(
+            "Skip very noisy windows in Full Record Analysis",
+            value=True,
+            help="Skips 10s windows where too much of the segment is flagged bad by SQA.",
+        )
+        bad_window_fraction_threshold = st.slider(
+            "Skip window if bad fraction >=",
+            min_value=0.30,
+            max_value=0.95,
+            value=0.60,
+            step=0.05,
+            help="Only used when skipping bad windows is enabled.",
         )
         
         st.divider()
@@ -1268,12 +1462,38 @@ else:
                 ecg_proc_full, _ = resample_for_processing(signals[:, 0], fs, target_fs=500)
                 if use_mti:
                     scg_proc_full = apply_mti_filter(scg_proc_full)
+
+                sqa_result_full_record = None
+                sample_bad_mask_full_record = None
+                if show_sqa_overlay:
+                    # Per-record SQA to avoid cross-record/global bias.
+                    sqa_result_full_record = autocorr_periodicity_sqa(
+                        scg_proc_full,
+                        fs=fs_proc_full,
+                        segment_seconds=float(sqa_segment_seconds),
+                        base_threshold=float(sqa_peak_threshold),
+                    )
+                    sample_bad_mask_full_record = build_sample_bad_mask(
+                        len(scg_proc_full),
+                        sqa_result_full_record,
+                    )
+
+                    valid_ratios_full = sqa_result_full_record["peak_ratios"]
+                    valid_ratios_full = valid_ratios_full[np.isfinite(valid_ratios_full)]
+                    if len(valid_ratios_full) > 0:
+                        bad_pct_full = float(np.mean(sample_bad_mask_full_record) * 100.0)
+                        st.caption(
+                            f"SQA threshold (per signal): {sqa_result_full_record['threshold']:.3f} | "
+                            f"Median peak ratio: {np.median(valid_ratios_full):.3f} | "
+                            f"Bad samples in full record: {bad_pct_full:.1f}%"
+                        )
                 
                 window_duration = 10.0  # 10 second windows
                 num_windows = int((len(scg_proc_full) / fs_proc_full) / window_duration)
                 
                 status_text = st.empty()
                 progress_bar = st.progress(0)
+                skipped_bad_windows = 0
                 
                 try:
                     start_time = time.time()
@@ -1288,6 +1508,12 @@ else:
                         # Extract window
                         start_idx_w = int(window_start * fs_proc_full)
                         end_idx_w = int(window_end * fs_proc_full)
+
+                        if sample_bad_mask_full_record is not None and exclude_bad_windows:
+                            bad_frac_window = float(np.mean(sample_bad_mask_full_record[start_idx_w:end_idx_w]))
+                            if bad_frac_window >= float(bad_window_fraction_threshold):
+                                skipped_bad_windows += 1
+                                continue
                         
                         ecg_window = ecg_proc_full[start_idx_w:end_idx_w]
                         scg_for_svmd_w = scg_proc_full[start_idx_w:end_idx_w]
@@ -1342,6 +1568,12 @@ else:
                     
                     status_text.text(f"Processing complete! Elapsed time: {elapsed_time:.2f} seconds")
                     progress_bar.progress(100)
+
+                    if show_sqa_overlay:
+                        st.info(
+                            f"SQA skipped windows: {skipped_bad_windows}/{num_windows} "
+                            f"({(100.0 * skipped_bad_windows / max(1, num_windows)):.1f}%)"
+                        )
                     
                     # Convert to numpy arrays
                     all_ao_peaks = np.array(all_ao_peaks)
@@ -1469,14 +1701,35 @@ else:
                             ), row=1, col=1)
                         
                         # Row 2: SCG signal with AO peaks
-                        fig_intervals.add_trace(go.Scatter(
-                            x=full_time_axis,
-                            y=full_scg,
-                            mode='lines',
-                            line=dict(color='navy', width=0.5),
-                            name='SCG',
-                            showlegend=True
-                        ), row=2, col=1)
+                        if sample_bad_mask_full_record is not None:
+                            scg_good = np.where(~sample_bad_mask_full_record, full_scg, np.nan)
+                            scg_bad = np.where(sample_bad_mask_full_record, full_scg, np.nan)
+
+                            fig_intervals.add_trace(go.Scatter(
+                                x=full_time_axis,
+                                y=scg_good,
+                                mode='lines',
+                                line=dict(color='navy', width=0.5),
+                                name='SCG (Good)',
+                                showlegend=True
+                            ), row=2, col=1)
+                            fig_intervals.add_trace(go.Scatter(
+                                x=full_time_axis,
+                                y=scg_bad,
+                                mode='lines',
+                                line=dict(color='red', width=0.9),
+                                name='SCG (Bad)',
+                                showlegend=True
+                            ), row=2, col=1)
+                        else:
+                            fig_intervals.add_trace(go.Scatter(
+                                x=full_time_axis,
+                                y=full_scg,
+                                mode='lines',
+                                line=dict(color='navy', width=0.5),
+                                name='SCG',
+                                showlegend=True
+                            ), row=2, col=1)
                         
                         if len(all_ao_peaks) > 0:
                             ao_peak_times = all_ao_peaks / fs_proc_full
