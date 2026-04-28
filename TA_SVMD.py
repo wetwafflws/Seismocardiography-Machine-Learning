@@ -428,13 +428,12 @@ def apply_mti_filter(raw_signal):
     
     return y_smoothed
 
-def autocorr_periodicity_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, max_hr_bpm=180,
-                             min_peak_prominence=0.03, base_threshold=0.25):
+def autocorr_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, max_hr_bpm=180,
+                 min_peak_prominence=0.03, autocorr_threshold=0.25):
     """
-    Segment-wise periodicity SQA using normalized autocorrelation peaks.
-
-    Metric per segment: strongest autocorrelation peak in a physiological lag range,
-    normalized by zero-lag autocorrelation.
+    Autocorrelation-only periodicity SQA.
+    
+    Flags segments with weak periodic peaks in the physiological HR range.
     """
     x = np.asarray(signal_in, dtype=float).flatten()
     n = len(x)
@@ -442,9 +441,8 @@ def autocorr_periodicity_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, 
         return {
             "segment_starts": np.array([]),
             "segment_ends": np.array([]),
-            "peak_ratios": np.array([]),
             "bad_mask": np.array([], dtype=bool),
-            "threshold": float(base_threshold),
+            "method": "autocorr",
         }
 
     seg_len = max(1, int(segment_seconds * fs))
@@ -457,22 +455,16 @@ def autocorr_periodicity_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, 
 
     peak_ratios = []
     seg_rms = []
-    seg_diff_rms = []
-    seg_ptp = []
     for s, e in zip(seg_starts, seg_ends):
         seg = x[s:e]
         if len(seg) < max(16, lag_max + 2):
             peak_ratios.append(np.nan)
             seg_rms.append(np.nan)
-            seg_diff_rms.append(np.nan)
-            seg_ptp.append(np.nan)
             continue
 
         seg_det = signal.detrend(seg)
         seg_rms.append(float(np.sqrt(np.mean(seg_det**2))))
-        seg_diff_rms.append(float(np.sqrt(np.mean(np.diff(seg_det)**2))))
-        seg_ptp.append(float(np.ptp(seg_det)))
-
+        
         seg_std = np.std(seg_det)
         if seg_std < 1e-10:
             peak_ratios.append(0.0)
@@ -506,54 +498,10 @@ def autocorr_periodicity_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, 
 
     peak_ratios = np.asarray(peak_ratios, dtype=float)
     seg_rms = np.asarray(seg_rms, dtype=float)
-    seg_diff_rms = np.asarray(seg_diff_rms, dtype=float)
-    seg_ptp = np.asarray(seg_ptp, dtype=float)
+    
+    bad_mask = np.isnan(peak_ratios) | (peak_ratios < autocorr_threshold)
 
-    def robust_high_mask(values, mad_mult=5.0):
-        vals = np.asarray(values, dtype=float)
-        valid_vals = vals[np.isfinite(vals)]
-        if len(valid_vals) == 0:
-            return np.zeros(len(vals), dtype=bool), np.nan
-
-        med = float(np.median(valid_vals))
-        mad = float(np.median(np.abs(valid_vals - med)))
-        if mad < 1e-12:
-            thr = med * 3.0 if med > 0 else 1e-6
-        else:
-            thr = med + mad_mult * mad
-
-        return vals > thr, float(thr)
-
-    valid = peak_ratios[np.isfinite(peak_ratios)]
-    if len(valid) > 0:
-        median_val = float(np.median(valid))
-        mad = float(np.median(np.abs(valid - median_val)))
-        robust_thr = median_val - 1.5 * mad
-        robust_thr = float(np.clip(robust_thr, 0.05, 0.95))
-        threshold = max(float(base_threshold), robust_thr)
-    else:
-        threshold = float(base_threshold)
-
-    periodicity_bad = np.isnan(peak_ratios) | (peak_ratios < threshold)
-
-    rms_bad, rms_thr = robust_high_mask(seg_rms, mad_mult=5.0)
-    diff_bad, diff_thr = robust_high_mask(seg_diff_rms, mad_mult=5.0)
-    ptp_bad, ptp_thr = robust_high_mask(seg_ptp, mad_mult=6.0)
-
-    artifact_votes = rms_bad.astype(int) + diff_bad.astype(int) + ptp_bad.astype(int)
-    artifact_bad = artifact_votes >= 2
-
-    valid_ptp = seg_ptp[np.isfinite(seg_ptp)]
-    if len(valid_ptp) > 0:
-        ptp_p99 = float(np.percentile(valid_ptp, 99))
-        ptp_med = float(np.median(valid_ptp))
-        extreme_ptp_bad = seg_ptp > max(ptp_p99, 4.0 * ptp_med)
-    else:
-        extreme_ptp_bad = np.zeros(len(seg_ptp), dtype=bool)
-
-    bad_mask = periodicity_bad | artifact_bad | extreme_ptp_bad
-
-    # Bridge isolated "good" segment between bad neighbors so large bursts stay contiguous.
+    # Bridge isolated good segments
     if len(bad_mask) >= 3:
         for idx in range(1, len(bad_mask) - 1):
             if (not bad_mask[idx]) and bad_mask[idx - 1] and bad_mask[idx + 1]:
@@ -562,16 +510,79 @@ def autocorr_periodicity_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, 
     return {
         "segment_starts": seg_starts,
         "segment_ends": seg_ends,
-        "peak_ratios": peak_ratios,
         "bad_mask": bad_mask,
-        "threshold": threshold,
-        "periodicity_bad": periodicity_bad,
-        "artifact_bad": artifact_bad,
-        "feature_thresholds": {
-            "rms": rms_thr,
-            "diff_rms": diff_thr,
-            "ptp": ptp_thr,
+        "peak_ratios": peak_ratios,
+        "seg_rms": seg_rms,
+        "method": "autocorr",
+    }
+
+def rms_sqa(signal_in, fs, segment_seconds=4.0, rms_low_percentile=20, rms_high_percentile=80,
+            rms_low_mad_mult=2.0, rms_high_mad_mult=4.0):
+    """
+    RMS-only SQA: detects both low RMS (dead/flat channels) and high RMS (bursts/noise).
+    
+    Parameters:
+      rms_low_percentile: Percentile for low RMS threshold (lower = stricter).
+      rms_high_percentile: Percentile for high RMS threshold (higher = more tolerant).
+      rms_low_mad_mult: MAD multiplier for low bound (higher = more tolerant).
+      rms_high_mad_mult: MAD multiplier for high bound (lower = stricter).
+    """
+    x = np.asarray(signal_in, dtype=float).flatten()
+    n = len(x)
+    if n == 0 or fs <= 0:
+        return {
+            "segment_starts": np.array([]),
+            "segment_ends": np.array([]),
+            "bad_mask": np.array([], dtype=bool),
+            "method": "rms",
+        }
+
+    seg_len = max(1, int(segment_seconds * fs))
+    seg_starts = np.arange(0, n, seg_len)
+    seg_ends = np.minimum(seg_starts + seg_len, n)
+
+    seg_rms = []
+    for s, e in zip(seg_starts, seg_ends):
+        seg = x[s:e]
+        if len(seg) < 16:
+            seg_rms.append(np.nan)
+            continue
+        seg_det = signal.detrend(seg)
+        seg_rms.append(float(np.sqrt(np.mean(seg_det**2))))
+
+    seg_rms = np.asarray(seg_rms, dtype=float)
+
+    valid_rms = seg_rms[np.isfinite(seg_rms)]
+    if len(valid_rms) > 0:
+        rms_low_perc = float(np.percentile(valid_rms, rms_low_percentile))
+        rms_high_perc = float(np.percentile(valid_rms, rms_high_percentile))
+        rms_med = float(np.median(valid_rms))
+        rms_mad = float(np.median(np.abs(valid_rms - rms_med)))
+        
+        rms_low_thr = max(rms_low_perc, rms_med - rms_low_mad_mult * rms_mad) if rms_mad > 1e-12 else rms_low_perc
+        rms_high_thr = max(rms_high_perc, rms_med + rms_high_mad_mult * rms_mad) if rms_mad > 1e-12 else rms_high_perc * 3.0
+    else:
+        rms_low_thr = 1e-10
+        rms_high_thr = float('inf')
+    
+    bad_mask = (seg_rms < rms_low_thr) | (seg_rms > rms_high_thr) | np.isnan(seg_rms)
+
+    # Bridge isolated good segments
+    if len(bad_mask) >= 3:
+        for idx in range(1, len(bad_mask) - 1):
+            if (not bad_mask[idx]) and bad_mask[idx - 1] and bad_mask[idx + 1]:
+                bad_mask[idx] = True
+
+    return {
+        "segment_starts": seg_starts,
+        "segment_ends": seg_ends,
+        "bad_mask": bad_mask,
+        "seg_rms": seg_rms,
+        "rms_bounds": {
+            "low": float(rms_low_thr),
+            "high": float(rms_high_thr),
         },
+        "method": "rms",
     }
 
 def build_sample_bad_mask(signal_len, sqa_result):
@@ -791,12 +802,21 @@ else:
         )
 
         st.divider()
-        st.subheader("SQA: Periodicity (Autocorrelation)")
+        st.divider()
+        st.subheader("SQA: Signal Quality Assessment")
         show_sqa_overlay = st.checkbox(
-            "Highlight low-quality SCG segments",
+            "Enable SQA (Highlight low-quality SCG segments)",
             value=True,
             help="Applies only to Full Record Analysis. Bad segments are shown in red.",
         )
+        
+        sqa_method = st.radio(
+            "SQA Method",
+            ["Autocorrelation (Periodicity)", "RMS (Low/High Bounds)"],
+            horizontal=True,
+            help="Autocorrelation: detects non-periodic noise. RMS: detects dead channels and bursts.",
+        )
+        
         sqa_segment_seconds = st.slider(
             "SQA Segment Length (s)",
             min_value=3,
@@ -804,14 +824,80 @@ else:
             value=4,
             step=1,
         )
-        sqa_peak_threshold = st.slider(
-            "Minimum autocorr peak ratio",
-            min_value=0.05,
-            max_value=0.80,
-            value=0.25,
-            step=0.01,
-            help="Peak ratio is first major periodic autocorr peak relative to zero-lag peak.",
-        )
+        
+        # Autocorrelation-specific parameters
+        if sqa_method == "Autocorrelation (Periodicity)":
+            st.caption("Autocorrelation Parameters:")
+            autocorr_threshold = st.slider(
+                "Autocorr peak ratio threshold",
+                min_value=0.05,
+                max_value=0.80,
+                value=0.25,
+                step=0.01,
+                key="autocorr_threshold",
+                help="Lower = stricter (more segments flagged). Peak ratio = autocorr peak / zero-lag.",
+            )
+            autocorr_prominence = st.slider(
+                "Autocorr peak prominence",
+                min_value=0.01,
+                max_value=0.10,
+                value=0.03,
+                step=0.01,
+                key="autocorr_prominence",
+                help="Higher = requires more distinct peaks.",
+            )
+        else:
+            autocorr_threshold = 0.25
+            autocorr_prominence = 0.03
+        
+        # RMS-specific parameters
+        if sqa_method == "RMS (Low/High Bounds)":
+            st.caption("RMS Parameters:")
+            col1, col2 = st.columns(2)
+            with col1:
+                rms_low_percentile = st.slider(
+                    "RMS low percentile",
+                    min_value=5,
+                    max_value=30,
+                    value=20,
+                    step=1,
+                    key="rms_low_perc",
+                    help="Lower = stricter on dead channels.",
+                )
+                rms_low_mad_mult = st.slider(
+                    "RMS low MAD multiplier",
+                    min_value=0.5,
+                    max_value=4.0,
+                    value=2.0,
+                    step=0.25,
+                    key="rms_low_mad",
+                    help="Higher = more tolerant of low RMS.",
+                )
+            with col2:
+                rms_high_percentile = st.slider(
+                    "RMS high percentile",
+                    min_value=70,
+                    max_value=95,
+                    value=80,
+                    step=1,
+                    key="rms_high_perc",
+                    help="Higher = more tolerant of bursts.",
+                )
+                rms_high_mad_mult = st.slider(
+                    "RMS high MAD multiplier",
+                    min_value=2.0,
+                    max_value=8.0,
+                    value=4.0,
+                    step=0.25,
+                    key="rms_high_mad",
+                    help="Lower = stricter on bursts.",
+                )
+        else:
+            rms_low_percentile = 20
+            rms_high_percentile = 80
+            rms_low_mad_mult = 2.0
+            rms_high_mad_mult = 4.0
+        
         exclude_bad_windows = st.checkbox(
             "Skip very noisy windows in Full Record Analysis",
             value=True,
@@ -1467,26 +1553,51 @@ else:
                 sample_bad_mask_full_record = None
                 if show_sqa_overlay:
                     # Per-record SQA to avoid cross-record/global bias.
-                    sqa_result_full_record = autocorr_periodicity_sqa(
-                        scg_proc_full,
-                        fs=fs_proc_full,
-                        segment_seconds=float(sqa_segment_seconds),
-                        base_threshold=float(sqa_peak_threshold),
-                    )
+                    if sqa_method == "Autocorrelation (Periodicity)":
+                        sqa_result_full_record = autocorr_sqa(
+                            scg_proc_full,
+                            fs=fs_proc_full,
+                            segment_seconds=float(sqa_segment_seconds),
+                            min_peak_prominence=float(autocorr_prominence),
+                            autocorr_threshold=float(autocorr_threshold),
+                        )
+                    else:  # RMS method
+                        sqa_result_full_record = rms_sqa(
+                            scg_proc_full,
+                            fs=fs_proc_full,
+                            segment_seconds=float(sqa_segment_seconds),
+                            rms_low_percentile=int(rms_low_percentile),
+                            rms_high_percentile=int(rms_high_percentile),
+                            rms_low_mad_mult=float(rms_low_mad_mult),
+                            rms_high_mad_mult=float(rms_high_mad_mult),
+                        )
+                    
                     sample_bad_mask_full_record = build_sample_bad_mask(
                         len(scg_proc_full),
                         sqa_result_full_record,
                     )
 
-                    valid_ratios_full = sqa_result_full_record["peak_ratios"]
-                    valid_ratios_full = valid_ratios_full[np.isfinite(valid_ratios_full)]
-                    if len(valid_ratios_full) > 0:
-                        bad_pct_full = float(np.mean(sample_bad_mask_full_record) * 100.0)
-                        st.caption(
-                            f"SQA threshold (per signal): {sqa_result_full_record['threshold']:.3f} | "
-                            f"Median peak ratio: {np.median(valid_ratios_full):.3f} | "
-                            f"Bad samples in full record: {bad_pct_full:.1f}%"
-                        )
+                    bad_pct_full = float(np.mean(sample_bad_mask_full_record) * 100.0)
+                    
+                    if sqa_method == "Autocorrelation (Periodicity)":
+                        peak_ratios = sqa_result_full_record.get("peak_ratios", np.array([]))
+                        valid_peaks = peak_ratios[np.isfinite(peak_ratios)]
+                        if len(valid_peaks) > 0:
+                            st.caption(
+                                f"Autocorr Method | Threshold: {autocorr_threshold:.3f} | "
+                                f"Median peak ratio: {np.median(valid_peaks):.3f} | "
+                                f"Bad samples: {bad_pct_full:.1f}%"
+                            )
+                    else:
+                        seg_rms = sqa_result_full_record.get("seg_rms", np.array([]))
+                        seg_rms_valid = seg_rms[np.isfinite(seg_rms)]
+                        if len(seg_rms_valid) > 0:
+                            rms_bounds = sqa_result_full_record.get("rms_bounds", {})
+                            st.caption(
+                                f"RMS Method | Bounds: [{rms_bounds['low']:.4f}, {rms_bounds['high']:.4f}] | "
+                                f"Median RMS: {np.median(seg_rms_valid):.4f} | "
+                                f"Bad samples: {bad_pct_full:.1f}%"
+                            )
                 
                 window_duration = 10.0  # 10 second windows
                 num_windows = int((len(scg_proc_full) / fs_proc_full) / window_duration)
@@ -1582,6 +1693,32 @@ else:
                     all_rr_intervals = np.array(all_rr_intervals)
                     all_ao_intervals_times = np.array(all_ao_intervals_times)
                     all_rr_intervals_times = np.array(all_rr_intervals_times)
+                    
+                    # Filter out intervals from bad segments if SQA is enabled
+                    if sample_bad_mask_full_record is not None and show_sqa_overlay:
+                        # Convert interval times (in seconds) to sample indices
+                        ao_interval_indices = (all_ao_intervals_times * fs_proc_full).astype(int)
+                        rr_interval_indices = (all_rr_intervals_times * fs_proc_full).astype(int)
+                        
+                        # Create masks for intervals in good regions
+                        ao_good_mask = np.array([
+                            not sample_bad_mask_full_record[min(idx, len(sample_bad_mask_full_record)-1)]
+                            for idx in ao_interval_indices
+                        ], dtype=bool)
+                        rr_good_mask = np.array([
+                            not sample_bad_mask_full_record[min(idx, len(sample_bad_mask_full_record)-1)]
+                            for idx in rr_interval_indices
+                        ], dtype=bool)
+                        
+                        # Filter intervals
+                        all_ao_intervals = all_ao_intervals[ao_good_mask]
+                        all_ao_intervals_times = all_ao_intervals_times[ao_good_mask]
+                        all_rr_intervals = all_rr_intervals[rr_good_mask]
+                        all_rr_intervals_times = all_rr_intervals_times[rr_good_mask]
+                        
+                        intervals_removed = (len(ao_interval_indices) - len(all_ao_intervals)) + (len(rr_interval_indices) - len(all_rr_intervals))
+                        if intervals_removed > 0:
+                            st.info(f"Filtered out {intervals_removed} intervals from bad segments")
                     
                     st.success(f"✅ Found {len(all_ao_peaks)} AO peaks and {len(all_r_peaks)} R peaks across entire record | ⏱️ Processing time: {elapsed_time:.2f} seconds")
 
