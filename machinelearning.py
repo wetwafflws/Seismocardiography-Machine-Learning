@@ -464,7 +464,8 @@ class TrainingWorker(QThread):
                 logits, _ = model(batch_x, batch_y, batch_z)
                 loss = criterion(logits, labels)
 
-                running_loss += loss.item() * labels.size(0)
+                batch_weight = labels.numel() if self.multi_label else labels.size(0)
+                running_loss += loss.item() * batch_weight
                 if self.multi_label:
                     pred = (logits > 0.0).float()
                     total += labels.numel()
@@ -539,6 +540,14 @@ class TrainingWorker(QThread):
                 shuffle=False,
             )
 
+            # Initialize model once — weights carry over across folds
+            model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
+            optimizer = torch.optim.AdamW(
+                model.parameters(),
+                lr=self.learning_rate,
+                weight_decay=self.weight_decay,
+            )
+
             best_val_loss = float('inf')
             best_fold = -1
             best_state_dict = None
@@ -576,11 +585,18 @@ class TrainingWorker(QThread):
                     fold_class_weights, fold_counts = self.compute_class_weights(label_train.cpu().numpy())
                     criterion = nn.CrossEntropyLoss(weight=fold_class_weights.to(device))
 
-                model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
+                # Reset only the classifier head for each new fold
+                def reset_linear(m):
+                    if isinstance(m, nn.Linear):
+                        m.reset_parameters()
+                model.classifier.apply(reset_linear)
                 optimizer = torch.optim.AdamW(
                     model.parameters(),
                     lr=self.learning_rate,
                     weight_decay=self.weight_decay,
+                )
+                scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                    optimizer, T_max=self.num_epochs, eta_min=1e-6
                 )
 
                 self.log_update.emit(
@@ -609,6 +625,7 @@ class TrainingWorker(QThread):
                         logits, _ = model(batch_x, batch_y, batch_z)
                         loss = criterion(logits, labels)
                         loss.backward()
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                         optimizer.step()
 
                         running_loss += loss.item() * labels.size(0)
@@ -624,6 +641,7 @@ class TrainingWorker(QThread):
                     train_loss = running_loss / max(total_samples, 1)
                     train_acc = 100.0 * correct_predictions / max(total_samples, 1)
                     val_loss, val_acc = self.evaluate_loader(model, criterion, val_loader, device)
+                    scheduler.step()
                     epoch_seconds = time.perf_counter() - epoch_start
 
                     completed_epoch_steps += 1
@@ -650,14 +668,12 @@ class TrainingWorker(QThread):
             if best_state_dict is None:
                 raise RuntimeError("Cross-validation did not produce a valid best model.")
 
-            final_model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
-            final_model.load_state_dict(best_state_dict)
+            model.load_state_dict(best_state_dict)
             if self.multi_label:
                 test_criterion = nn.BCEWithLogitsLoss()
             else:
-                test_weights, _ = self.compute_class_weights(self.label_tensor[train_idx].cpu().numpy())
-                test_criterion = nn.CrossEntropyLoss(weight=test_weights.to(device))
-            test_loss, test_acc = self.evaluate_loader(final_model, test_criterion, test_loader, device)
+                test_criterion = nn.CrossEntropyLoss()
+            test_loss, test_acc = self.evaluate_loader(model, test_criterion, test_loader, device)
             self.test_update.emit(test_loss, test_acc)
 
             self.finished_update.emit({
@@ -706,6 +722,8 @@ class HVDMainWindow(QMainWindow):
         self.dataset_class_summary_cache = None
         self.last_inference_result = None
         self.is_training_paused = False
+        self.current_num_epochs = 100
+        self.current_n_splits = 5
         
         self.loader = HVDNetDataLoader(data_dir="Data/") # Assumes scripts and data are in the same folder
         
@@ -752,7 +770,7 @@ class HVDMainWindow(QMainWindow):
         self.annotation_selector.addItems(["ECG R-peaks", "AO peaks (Saved_Peaks)"])
         self.peak_filter_selector = QComboBox()
         self.peak_filter_selector.addItems(["Keep all peaks", "Discard impossible peaks"])
-        self.peak_filter_selector.setToolTip("Drops peaks with inter-peak intervals outside 0.27s to 2.0s before segmentation when enabled.")
+        self.peak_filter_selector.setToolTip("Drops peaks with inter-peak intervals outside 0.50s to 1.50s (40-120 BPM) before segmentation when enabled.")
         self.step1_btn = QPushButton("Step 1: Load Data")
         self.step1_btn.clicked.connect(self.step_load_data)
         self.step2_btn = QPushButton("Step 2:\nFilter (1-30 Hz)")
@@ -771,6 +789,9 @@ class HVDMainWindow(QMainWindow):
         self.step8_btn.clicked.connect(self.step_build_hvdnet)
         self.step9_btn = QPushButton("Step 9:\nTrain Model")
         self.step9_btn.clicked.connect(self.step_train_model)
+        self.small_training_mode = QComboBox()
+        self.small_training_mode.addItems(["Full training (5-fold, 100 epochs)", "Small training (3-fold, 50 epochs)"])
+        self.small_training_mode.setToolTip("Use fewer folds and epochs for quicker iteration.")
         self.pause_resume_btn = QPushButton("Pause Training")
         self.pause_resume_btn.clicked.connect(self.step_toggle_training_pause)
         self.load_model_btn = QPushButton("Load Saved\nModel")
@@ -842,6 +863,7 @@ class HVDMainWindow(QMainWindow):
         input_layout.addWidget(self.step6_btn)
         input_layout.addWidget(self.step7_btn)
         input_layout.addWidget(self.step8_btn)
+        input_layout.addWidget(self.small_training_mode)
         input_layout.addWidget(self.step9_btn)
         input_layout.addWidget(self.pause_resume_btn)
         input_layout.addWidget(self.load_model_btn)
@@ -1361,21 +1383,26 @@ class HVDMainWindow(QMainWindow):
         self.log("\n--- Step 3: Build Peak-Based Segments ---")
         use_physio_filter = self.peak_filter_selector.currentIndex() == 1
         source_peaks = np.asarray(self.current_data['r_peaks_indices'], dtype=int)
-        segment_peaks, discarded_count = self.filter_peaks_by_physiology(
-            source_peaks,
-            fs=self.current_data['fs'],
-            enabled=use_physio_filter,
-            min_interval_sec=0.27,
-            max_interval_sec=2.0,
-        )
 
-        self.current_data['segment_peak_indices'] = segment_peaks
-        self.current_data['segment_peak_discarded_count'] = int(discarded_count)
-
-        self.segments = self.build_rpeak_segments(
-            segment_peaks,
-            self.current_data['signal_length']
-        )
+        if use_physio_filter:
+            # Build segments using 3-beat windows and filter by BPM (40-120 BPM).
+            segments, discarded_segments = self.build_threebeat_segments(
+                source_peaks,
+                self.current_data['signal_length'],
+                fs=self.current_data['fs'],
+                min_bpm=40,
+                max_bpm=120,
+            )
+            self.segments = segments
+            self.current_data['segment_peak_indices'] = source_peaks  # keep original peaks intact
+            self.current_data['segment_peak_discarded_count'] = int(discarded_segments)
+        else:
+            self.current_data['segment_peak_indices'] = source_peaks
+            self.current_data['segment_peak_discarded_count'] = 0
+            self.segments = self.build_rpeak_segments(
+                source_peaks,
+                self.current_data['signal_length']
+            )
         self.preprocessed_segments = []
         self.current_segment_idx = 0
         self.view_mode.setCurrentIndex(1)
@@ -1386,9 +1413,9 @@ class HVDMainWindow(QMainWindow):
         self.log("[SUCCESS] Segmentation complete.")
         self.log(" > Segment rule: P_i to P_{i+3}")
         if use_physio_filter:
-            self.log(" > Physiological filter: ON (interval range 0.27s to 2.0s)")
-            self.log(f" > Peaks discarded as physiologically impossible: {discarded_count}")
-            self.log(f" > Peaks used for segmentation: {len(segment_peaks)} / {len(source_peaks)}")
+            self.log(" > Physiological filter: ON (interval range 0.50s to 1.50s -> 40-120 BPM)")
+            self.log(f" > Segments discarded as physiologically impossible: {self.current_data['segment_peak_discarded_count']}")
+            self.log(f" > Peaks used for segmentation: {len(source_peaks)}")
         else:
             self.log(" > Physiological filter: OFF")
             self.log(" > Peaks discarded as physiologically impossible: 0")
@@ -1935,6 +1962,12 @@ class HVDMainWindow(QMainWindow):
             self.current_training_task = task_name
             dataset_info = self.build_training_dataset(task_name)
 
+            is_small_training = self.small_training_mode.currentIndex() == 1
+            num_epochs = 50 if is_small_training else 100
+            n_splits = 3 if is_small_training else 5
+            self.current_num_epochs = num_epochs
+            self.current_n_splits = n_splits
+
             self.log("[SUCCESS] Training dataset prepared from all available patient files.")
             self.log(f" > Task: {task_name}")
             self.log(f" > Task classes: {dataset_info['class_names']}")
@@ -1950,12 +1983,12 @@ class HVDMainWindow(QMainWindow):
                 label_tensor=dataset_info['label_tensor'],
                 num_classes=5,
                 d=64,
-                num_epochs=100,
+                num_epochs=num_epochs,
                 batch_size=64,
                 learning_rate=0.001,
                 weight_decay=0.004,
                 test_size=0.2,
-                n_splits=5,
+                n_splits=n_splits,
                 random_state=42,
                 multi_label=(task_name == "Task III"),
             )
@@ -1969,9 +2002,9 @@ class HVDMainWindow(QMainWindow):
 
             self.log("[INFO] Training started in a background thread to keep the UI responsive.")
             if task_name == "Task III":
-                self.log("[INFO] Split strategy: 80% train pool / 20% held-out test, then 5-fold KFold on train pool.")
+                self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold KFold on train pool.")
             else:
-                self.log("[INFO] Split strategy: 80% train pool / 20% held-out test, then 5-fold stratified CV on train pool.")
+                self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold stratified CV on train pool.")
             self.update_step_controls()
         except Exception as e:
             self.log(f"[ERROR] Training setup failed: {str(e)}")
@@ -2001,7 +2034,7 @@ class HVDMainWindow(QMainWindow):
         epoch_time_text = self.format_seconds(epoch_seconds)
         eta_text = self.format_seconds(eta_seconds)
         self.log(
-            f"Fold [{fold}/5] Epoch [{epoch}/100] | "
+            f"Fold [{fold}/{self.current_n_splits}] Epoch [{epoch}/{self.current_num_epochs}] | "
             f"Train Loss: {train_loss:.4f} Acc: {train_acc:.2f}% | "
             f"Val Loss: {val_loss:.4f} Acc: {val_acc:.2f}% | "
             f"Epoch Time: {epoch_time_text} | ETA: {eta_text}"
@@ -2766,26 +2799,99 @@ class HVDMainWindow(QMainWindow):
                 })
         return segments
 
-    def filter_peaks_by_physiology(self, peak_indices, fs, enabled=False, min_interval_sec=0.27, max_interval_sec=2.0):
+    def build_threebeat_segments(self, r_peaks, signal_length, fs, min_bpm=40, max_bpm=120):
+        """
+        Build segments from r_peaks using 3-beat windows (P_i to P_{i+3}).
+        Only keep segments whose average beat rate (computed from the 3-beat window)
+        falls within [min_bpm, max_bpm]. Returns (segments, discarded_count).
+        """
+        r_peaks = np.asarray(r_peaks, dtype=int)
+        segments = []
+        discarded = 0
+        if len(r_peaks) < 4:
+            return segments, discarded
+
+        min_seg_samples = int(np.round((3.0 * 60.0) / max_bpm * fs))  # 3 beats at max_bpm -> min segment length
+        max_seg_samples = int(np.round((3.0 * 60.0) / min_bpm * fs))  # 3 beats at min_bpm -> max segment length
+
+        for i in range(len(r_peaks) - 3):
+            start_idx = int(r_peaks[i])
+            end_idx = int(r_peaks[i + 3])
+            seg_len = end_idx - start_idx
+            if not (0 <= start_idx < end_idx <= signal_length):
+                discarded += 1
+                continue
+
+            if min_seg_samples <= seg_len <= max_seg_samples:
+                segments.append({
+                    'segment_id': i,
+                    'start_idx': start_idx,
+                    'end_idx': end_idx,
+                    'start_peak_number': i,
+                    'end_peak_number': i + 3
+                })
+            else:
+                discarded += 1
+
+        return segments, int(discarded)
+
+    def filter_peaks_by_physiology(self, peak_indices, fs, enabled=False, min_interval_sec=0.5, max_interval_sec=1.5):
         peak_indices = np.asarray(peak_indices, dtype=int)
         if len(peak_indices) <= 1 or not enabled:
             return peak_indices, 0
 
-        sorted_unique = np.unique(np.sort(peak_indices))
-        accepted = [int(sorted_unique[0])]
-        discarded = 0
+        # Less strict peak filtering:
+        # - Only remove peaks that create intervals that are too short (likely duplicates/noise).
+        # - Do NOT discard peaks that create long intervals (likely missed detections) because
+        #   removing in that case removes valid data. This preserves valid peaks.
 
-        min_interval_samples = int(np.round(min_interval_sec * fs))
-        max_interval_samples = int(np.round(max_interval_sec * fs))
+        sorted_unique = np.unique(np.sort(peak_indices)).astype(int)
+        min_samples = int(np.round(min_interval_sec * fs))
+        max_samples = int(np.round(max_interval_sec * fs))
 
-        for candidate in sorted_unique[1:]:
-            interval = int(candidate) - int(accepted[-1])
-            if min_interval_samples <= interval <= max_interval_samples:
-                accepted.append(int(candidate))
-            else:
-                discarded += 1
+        if len(sorted_unique) <= 1:
+            return sorted_unique, 0
 
-        return np.asarray(accepted, dtype=int), int(discarded)
+        keep = np.ones(len(sorted_unique), dtype=bool)
+
+        # Iterate and remove obvious duplicates (too-short intervals).
+        # Use an iterative pass because removing a peak changes neighboring intervals.
+        removed = 0
+        changed = True
+        while changed:
+            changed = False
+            idxs = np.where(keep)[0]
+            if len(idxs) <= 1:
+                break
+            positions = sorted_unique[idxs]
+            intervals = np.diff(positions)
+            for j, interval in enumerate(intervals):
+                if interval < min_samples:
+                    # violation between positions[j] and positions[j+1]
+                    global_i = idxs[j]
+                    global_j = idxs[j+1]
+
+                    # Decide which of the two peaks to remove.
+                    # Heuristic: remove the peak that is closer to its other neighbor (i.e., forms smaller adjacent interval),
+                    # or prefer removing the later one if ambiguous.
+                    left_gap = positions[j] - positions[j-1] if j-1 >= 0 else np.inf
+                    right_gap = positions[j+2] - positions[j+1] if j+2 < len(positions) else np.inf
+
+                    # Compare neighbor gaps to choose removal candidate
+                    if left_gap < right_gap:
+                        # remove earlier peak (global_i)
+                        keep[global_i] = False
+                    else:
+                        # remove later peak (global_j)
+                        keep[global_j] = False
+
+                    removed += 1
+                    changed = True
+                    break
+                # For intervals > max_samples we do NOT remove peaks here (too risky)
+
+        accepted = sorted_unique[keep]
+        return accepted.astype(int), int(removed)
 
     def on_view_mode_changed(self, _index):
         self.current_segment_idx = 0

@@ -1719,6 +1719,23 @@ else:
                         intervals_removed = (len(ao_interval_indices) - len(all_ao_intervals)) + (len(rr_interval_indices) - len(all_rr_intervals))
                         if intervals_removed > 0:
                             st.info(f"Filtered out {intervals_removed} intervals from bad segments")
+                    # Apply physiological HR limits (30 bpm - 140 bpm) to interval sets (in ms)
+                    min_interval_ms = (60.0 / 140.0) * 1000.0
+                    max_interval_ms = (60.0 / 30.0) * 1000.0
+                    if len(all_ao_intervals) > 0:
+                        ao_phys_mask = (all_ao_intervals >= min_interval_ms) & (all_ao_intervals <= max_interval_ms)
+                        removed_ao_phys = np.sum(~ao_phys_mask)
+                        if removed_ao_phys > 0:
+                            all_ao_intervals = all_ao_intervals[ao_phys_mask]
+                            all_ao_intervals_times = all_ao_intervals_times[ao_phys_mask]
+                            st.info(f"Filtered out {removed_ao_phys} AO intervals outside physiological bounds ({min_interval_ms:.1f}-{max_interval_ms:.1f} ms)")
+                    if len(all_rr_intervals) > 0:
+                        rr_phys_mask = (all_rr_intervals >= min_interval_ms) & (all_rr_intervals <= max_interval_ms)
+                        removed_rr_phys = np.sum(~rr_phys_mask)
+                        if removed_rr_phys > 0:
+                            all_rr_intervals = all_rr_intervals[rr_phys_mask]
+                            all_rr_intervals_times = all_rr_intervals_times[rr_phys_mask]
+                            st.info(f"Filtered out {removed_rr_phys} RR intervals outside physiological bounds ({min_interval_ms:.1f}-{max_interval_ms:.1f} ms)")
                     
                     st.success(f"✅ Found {len(all_ao_peaks)} AO peaks and {len(all_r_peaks)} R peaks across entire record | ⏱️ Processing time: {elapsed_time:.2f} seconds")
 
@@ -2162,6 +2179,31 @@ else:
                                 if use_mti:
                                     scg_proc_batch = apply_mti_filter(scg_proc_batch)
 
+                                # Compute per-record SQA mask for this batch record
+                                sqa_result_record = None
+                                sample_bad_mask_record = None
+                                if show_sqa_overlay:
+                                    if sqa_method == "Autocorrelation (Periodicity)":
+                                        sqa_result_record = autocorr_sqa(
+                                            scg_proc_batch,
+                                            fs=fs_proc_batch,
+                                            segment_seconds=float(sqa_segment_seconds),
+                                            min_peak_prominence=float(autocorr_prominence),
+                                            autocorr_threshold=float(autocorr_threshold),
+                                        )
+                                    else:
+                                        sqa_result_record = rms_sqa(
+                                            scg_proc_batch,
+                                            fs=fs_proc_batch,
+                                            segment_seconds=float(sqa_segment_seconds),
+                                            rms_low_percentile=int(rms_low_percentile),
+                                            rms_high_percentile=int(rms_high_percentile),
+                                            rms_low_mad_mult=float(rms_low_mad_mult),
+                                            rms_high_mad_mult=float(rms_high_mad_mult),
+                                        )
+
+                                    sample_bad_mask_record = build_sample_bad_mask(len(scg_proc_batch), sqa_result_record)
+
                                 window_duration = 10.0
                                 if total_duration_batch <= skip_seconds + window_duration:
                                     batch_full_results.append({
@@ -2187,6 +2229,7 @@ else:
                                 usable_duration = total_duration_batch - skip_seconds
                                 num_windows = int(usable_duration / window_duration)
 
+                                skipped_bad_windows_local = 0
                                 for i in range(num_windows):
                                     window_start = skip_seconds + i * window_duration
                                     window_end = window_start + window_duration
@@ -2195,6 +2238,13 @@ else:
                                     end_idx_w = int(window_end * fs_proc_batch)
                                     if end_idx_w > len(scg_proc_batch):
                                         break
+
+                                    # Skip window if too noisy according to SQA
+                                    if sample_bad_mask_record is not None and exclude_bad_windows:
+                                        bad_frac = float(np.mean(sample_bad_mask_record[start_idx_w:end_idx_w]))
+                                        if bad_frac >= float(bad_window_fraction_threshold):
+                                            skipped_bad_windows_local += 1
+                                            continue
 
                                     ecg_window = ecg_proc_batch[start_idx_w:end_idx_w]
                                     scg_for_svmd_w = scg_proc_batch[start_idx_w:end_idx_w]
@@ -2226,6 +2276,56 @@ else:
 
                                 all_ao_intervals_batch = np.array(all_ao_intervals_batch)
                                 all_rr_intervals_batch = np.array(all_rr_intervals_batch)
+
+                                # Filter intervals that fall inside bad SQA segments
+                                if sample_bad_mask_record is not None and show_sqa_overlay:
+                                    # Recompute intervals from peak indices to ensure consistent lengths
+                                    if len(all_ao_peaks_batch) > 1:
+                                        ao_peak_idxs = np.array(all_ao_peaks_batch, dtype=int)
+                                        # Recompute AO intervals (ms) from peaks to guarantee alignment
+                                        recomputed_ao_intervals = np.diff(ao_peak_idxs) / fs_proc_batch * 1000
+                                        ao_mid_idx = ((ao_peak_idxs[:-1] + ao_peak_idxs[1:]) // 2)
+                                        # Trim to common length if any discrepancy
+                                        n_int = len(recomputed_ao_intervals)
+                                        if len(ao_mid_idx) > n_int:
+                                            ao_mid_idx = ao_mid_idx[:n_int]
+                                        if np.max(ao_mid_idx) >= len(sample_bad_mask_record):
+                                            valid = ao_mid_idx < len(sample_bad_mask_record)
+                                            ao_mid_idx = ao_mid_idx[valid]
+                                            recomputed_ao_intervals = recomputed_ao_intervals[valid]
+                                        ao_keep_mask = ~sample_bad_mask_record[ao_mid_idx]
+                                        all_ao_intervals_batch = recomputed_ao_intervals[ao_keep_mask]
+                                    if len(all_r_peaks_batch) > 1:
+                                        r_peak_idxs = np.array(all_r_peaks_batch, dtype=int)
+                                        recomputed_rr_intervals = np.diff(r_peak_idxs) / fs_proc_batch * 1000
+                                        r_mid_idx = ((r_peak_idxs[:-1] + r_peak_idxs[1:]) // 2)
+                                        n_int_r = len(recomputed_rr_intervals)
+                                        if len(r_mid_idx) > n_int_r:
+                                            r_mid_idx = r_mid_idx[:n_int_r]
+                                        if np.max(r_mid_idx) >= len(sample_bad_mask_record):
+                                            valid_r = r_mid_idx < len(sample_bad_mask_record)
+                                            r_mid_idx = r_mid_idx[valid_r]
+                                            recomputed_rr_intervals = recomputed_rr_intervals[valid_r]
+                                        rr_keep_mask = ~sample_bad_mask_record[r_mid_idx]
+                                        all_rr_intervals_batch = recomputed_rr_intervals[rr_keep_mask]
+
+                                # Apply physiological HR limits (30-140 bpm) to batch intervals (ms)
+                                min_interval_ms = (60.0 / 140.0) * 1000.0
+                                max_interval_ms = (60.0 / 30.0) * 1000.0
+                                if len(all_ao_intervals_batch) > 0:
+                                    ao_phys_mask_b = (all_ao_intervals_batch >= min_interval_ms) & (all_ao_intervals_batch <= max_interval_ms)
+                                    removed_ao_phys_b = int(np.sum(~ao_phys_mask_b))
+                                    if removed_ao_phys_b > 0:
+                                        all_ao_intervals_batch = all_ao_intervals_batch[ao_phys_mask_b]
+                                if len(all_rr_intervals_batch) > 0:
+                                    rr_phys_mask_b = (all_rr_intervals_batch >= min_interval_ms) & (all_rr_intervals_batch <= max_interval_ms)
+                                    removed_rr_phys_b = int(np.sum(~rr_phys_mask_b))
+                                    if removed_rr_phys_b > 0:
+                                        all_rr_intervals_batch = all_rr_intervals_batch[rr_phys_mask_b]
+
+                                # Optionally report skipped windows
+                                if show_sqa_overlay and skipped_bad_windows_local > 0:
+                                    st.info(f"{skipped_bad_windows_local} windows skipped for {record_name} due to SQA")
 
                                 if remove_outliers:
                                     min_len = min(len(all_ao_intervals_batch), len(all_rr_intervals_batch))
@@ -2298,7 +2398,8 @@ else:
                                     "Correlation": "N/A",
                                     "RMSE (ms)": "N/A",
                                     "MAE (ms)": "N/A",
-                                    "Status": "❌ Error"
+                                    "Status": "❌ Error",
+                                    "Error": str(e)
                                 })
 
                     else:
@@ -2320,6 +2421,31 @@ else:
                                 if use_mti:
                                     scg_proc_batch = apply_mti_filter(scg_proc_batch)
 
+                                # Compute per-record SQA mask for this batch record
+                                sqa_result_record = None
+                                sample_bad_mask_record = None
+                                if show_sqa_overlay:
+                                    if sqa_method == "Autocorrelation (Periodicity)":
+                                        sqa_result_record = autocorr_sqa(
+                                            scg_proc_batch,
+                                            fs=fs_proc_batch,
+                                            segment_seconds=float(sqa_segment_seconds),
+                                            min_peak_prominence=float(autocorr_prominence),
+                                            autocorr_threshold=float(autocorr_threshold),
+                                        )
+                                    else:
+                                        sqa_result_record = rms_sqa(
+                                            scg_proc_batch,
+                                            fs=fs_proc_batch,
+                                            segment_seconds=float(sqa_segment_seconds),
+                                            rms_low_percentile=int(rms_low_percentile),
+                                            rms_high_percentile=int(rms_high_percentile),
+                                            rms_low_mad_mult=float(rms_low_mad_mult),
+                                            rms_high_mad_mult=float(rms_high_mad_mult),
+                                        )
+
+                                    sample_bad_mask_record = build_sample_bad_mask(len(scg_proc_batch), sqa_result_record)
+
                                 # Initialize accumulators
                                 all_ao_intervals_batch = []
                                 all_rr_intervals_batch = []
@@ -2330,12 +2456,20 @@ else:
                                 num_windows = int(total_duration_batch / window_duration)
 
                                 # Process each 10s window
+                                skipped_bad_windows_local = 0
                                 for i in range(num_windows):
                                     window_start = i * window_duration
                                     window_end = window_start + window_duration
 
                                     start_idx_w = int(window_start * fs_proc_batch)
                                     end_idx_w = int(window_end * fs_proc_batch)
+
+                                    # Skip window if too noisy according to SQA
+                                    if sample_bad_mask_record is not None and exclude_bad_windows:
+                                        bad_frac = float(np.mean(sample_bad_mask_record[start_idx_w:end_idx_w]))
+                                        if bad_frac >= float(bad_window_fraction_threshold):
+                                            skipped_bad_windows_local += 1
+                                            continue
 
                                     ecg_window = ecg_proc_batch[start_idx_w:end_idx_w]
                                     scg_for_svmd_w = scg_proc_batch[start_idx_w:end_idx_w]
@@ -2374,6 +2508,59 @@ else:
                                 # Convert to arrays
                                 all_ao_intervals_batch = np.array(all_ao_intervals_batch)
                                 all_rr_intervals_batch = np.array(all_rr_intervals_batch)
+
+                                # Filter intervals that fall inside bad SQA segments
+                                if sample_bad_mask_record is not None and show_sqa_overlay:
+                                    # Recompute intervals from peak indices to ensure consistent lengths
+                                    if len(all_ao_peaks_batch) > 1:
+                                        ao_peak_idxs = np.array(all_ao_peaks_batch, dtype=int)
+                                        # Recompute AO intervals (ms) from peaks to guarantee alignment
+                                        recomputed_ao_intervals = np.diff(ao_peak_idxs) / fs_proc_batch * 1000
+                                        ao_mid_idx = ((ao_peak_idxs[:-1] + ao_peak_idxs[1:]) // 2)
+                                        # Trim to common length if any discrepancy
+                                        n_int = len(recomputed_ao_intervals)
+                                        if len(ao_mid_idx) > n_int:
+                                            ao_mid_idx = ao_mid_idx[:n_int]
+                                        if np.max(ao_mid_idx) >= len(sample_bad_mask_record):
+                                            valid = ao_mid_idx < len(sample_bad_mask_record)
+                                            ao_mid_idx = ao_mid_idx[valid]
+                                            recomputed_ao_intervals = recomputed_ao_intervals[valid]
+                                        ao_keep_mask = ~sample_bad_mask_record[ao_mid_idx]
+                                        all_ao_intervals_batch = recomputed_ao_intervals[ao_keep_mask]
+                                    if len(all_r_peaks_batch) > 1:
+                                        r_peak_idxs = np.array(all_r_peaks_batch, dtype=int)
+                                        recomputed_rr_intervals = np.diff(r_peak_idxs) / fs_proc_batch * 1000
+                                        r_mid_idx = ((r_peak_idxs[:-1] + r_peak_idxs[1:]) // 2)
+                                        n_int_r = len(recomputed_rr_intervals)
+                                        if len(r_mid_idx) > n_int_r:
+                                            r_mid_idx = r_mid_idx[:n_int_r]
+                                        if np.max(r_mid_idx) >= len(sample_bad_mask_record):
+                                            valid_r = r_mid_idx < len(sample_bad_mask_record)
+                                            r_mid_idx = r_mid_idx[valid_r]
+                                            recomputed_rr_intervals = recomputed_rr_intervals[valid_r]
+                                        rr_keep_mask = ~sample_bad_mask_record[r_mid_idx]
+                                        all_rr_intervals_batch = recomputed_rr_intervals[rr_keep_mask]
+
+                                # Apply physiological HR limits (30-140 bpm) to batch intervals (ms)
+                                min_interval_ms = (60.0 / 140.0) * 1000.0
+                                max_interval_ms = (60.0 / 30.0) * 1000.0
+                                if len(all_ao_intervals_batch) > 0:
+                                    ao_phys_mask_b = (all_ao_intervals_batch >= min_interval_ms) & (all_ao_intervals_batch <= max_interval_ms)
+                                    removed_ao_phys_b = int(np.sum(~ao_phys_mask_b))
+                                    if removed_ao_phys_b > 0:
+                                        all_ao_intervals_batch = all_ao_intervals_batch[ao_phys_mask_b]
+                                if len(all_rr_intervals_batch) > 0:
+                                    rr_phys_mask_b = (all_rr_intervals_batch >= min_interval_ms) & (all_rr_intervals_batch <= max_interval_ms)
+                                    removed_rr_phys_b = int(np.sum(~rr_phys_mask_b))
+                                    if removed_rr_phys_b > 0:
+                                        all_rr_intervals_batch = all_rr_intervals_batch[rr_phys_mask_b]
+
+                                # Optionally report skipped windows
+                                if show_sqa_overlay and skipped_bad_windows_local > 0:
+                                    st.info(f"{skipped_bad_windows_local} windows skipped for {record_name} due to SQA")
+
+                                if show_sqa_overlay and skipped_bad_windows_local > 0:
+                                    st.info(f"{skipped_bad_windows_local} windows skipped for {record_name} due to SQA")
 
                                 # Apply paired outlier removal if enabled
                                 if remove_outliers:
@@ -2446,7 +2633,8 @@ else:
                                     "Correlation": "N/A",
                                     "RMSE (ms)": "N/A",
                                     "MAE (ms)": "N/A",
-                                    "Status": "❌ Error"
+                                    "Status": "❌ Error",
+                                    "Error": str(e)
                                 })
 
                     status_text.text("Batch processing complete!")
