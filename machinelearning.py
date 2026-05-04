@@ -17,7 +17,7 @@ from sklearn.model_selection import KFold, train_test_split, StratifiedKFold
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
 import scipy.ndimage
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                             QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QComboBox, QTabWidget, QGridLayout, QScrollArea, QSizePolicy)
+                             QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QComboBox, QTabWidget, QGridLayout, QScrollArea, QSizePolicy, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF
 
 # Ensure pyqtgraph uses the same Qt binding as the app.
@@ -53,6 +53,8 @@ class HVDNetDataLoader:
         self.label_to_index = {name: idx for idx, name in enumerate(self.label_columns)}
         self.task_class_names = {
             "Task I": ["AS", "MR", "MS", "AR", "N"],
+            "Task I (MS+AR)": ["AS", "MR", "MS+AR (Others)"],
+            "Task I (AS+MR)": ["AS", "MR"],
             "Task II": ["AS", "AS-MR", "AS-MS", "AS-AR", "AS-TR"],
             "Task III": ["MS", "MR", "AR", "AS", "TR"],
         }
@@ -242,6 +244,36 @@ class HVDNetDataLoader:
                 return 3
             return None
 
+        if task_name == "Task I (MS+AR)":
+            # Exact classes: AS, MR, MS+AR (no co-existing diseases, ignore Normal)
+            if total_positive == 0:
+                return None
+            if tr == 1:
+                return None
+            if (as_val + mr + ms + ar) != 1:
+                return None
+            if as_val == 1:
+                return 0
+            if mr == 1:
+                return 1
+            if ms == 1 or ar == 1:
+                return 2
+            return None
+
+        if task_name == "Task I (AS+MR)":
+            # Exact classes: AS, MR (no co-existing diseases, ignore Normal)
+            if total_positive == 0:
+                return None
+            if tr == 1 or ms == 1 or ar == 1:
+                return None
+            if (as_val + mr) != 1:
+                return None
+            if as_val == 1:
+                return 0
+            if mr == 1:
+                return 1
+            return None
+
         if task_name == "Task II":
             # Exact classes: AS, AS-MR, AS-MS, AS-AR, AS-TR
             if as_val != 1:
@@ -308,13 +340,13 @@ class sCNN_Block(nn.Module):
 
 
 class SCNN_Module(nn.Module):
-    def __init__(self, in_channels=1, base_filters=64, kernel_size=7):
+    def __init__(self, in_channels=1, base_filters=64, kernel_sizes=(7, 7, 3)):
         super().__init__()
         channels = (base_filters, base_filters // 2, base_filters // 4)
         blocks = []
         c_in = in_channels
-        for c_out in channels:
-            blocks.append(sCNN_Block(c_in, c_out, kernel_size))
+        for c_out, ks in zip(channels, kernel_sizes):
+            blocks.append(sCNN_Block(c_in, c_out, ks))
             c_in = c_out
         self.blocks = nn.Sequential(*blocks)
 
@@ -372,6 +404,11 @@ class HVDNet(nn.Module):
         self.sa_y = SA_Module(hidden_size=d)
         self.sa_z = SA_Module(hidden_size=d)
 
+        self.bn_x = nn.BatchNorm1d(d)
+        self.bn_y = nn.BatchNorm1d(d)
+        self.bn_z = nn.BatchNorm1d(d)
+        self.dropout_sa = nn.Dropout(p=0.4)
+
         self.classifier = nn.Sequential(
             nn.Linear(3 * d, d),
             nn.ReLU(),
@@ -393,6 +430,11 @@ class HVDNet(nn.Module):
         ctx_y, attn_y = self.sa_y(lstm_y)
         ctx_z, attn_z = self.sa_z(lstm_z)
 
+        # Apply BN + Dropout after each SA layer (as per paper Fig. a)
+        ctx_x = self.dropout_sa(self.bn_x(ctx_x))
+        ctx_y = self.dropout_sa(self.bn_y(ctx_y))
+        ctx_z = self.dropout_sa(self.bn_z(ctx_z))
+
         concat_vector = torch.cat((ctx_x, ctx_y, ctx_z), dim=1)
         logits = self.classifier(concat_vector)
 
@@ -408,7 +450,8 @@ class TrainingWorker(QThread):
 
     def __init__(self, x_tensor, y_tensor, z_tensor, label_tensor, num_classes=5, d=64,
                  num_epochs=100, batch_size=64, learning_rate=0.001, weight_decay=0.004,
-                 test_size=0.2, n_splits=5, random_state=42, multi_label=False, parent=None):
+                 test_size=0.2, n_splits=5, random_state=42, multi_label=False,
+                 patient_ids=None, split_by_patient=False, class_names=None, parent=None):
         super().__init__(parent)
         self.x_tensor = x_tensor
         self.y_tensor = y_tensor
@@ -424,6 +467,9 @@ class TrainingWorker(QThread):
         self.n_splits = n_splits
         self.random_state = random_state
         self.multi_label = multi_label
+        self.patient_ids = patient_ids
+        self.split_by_patient = split_by_patient
+        self.class_names = class_names
         self._pause_event = threading.Event()
         self._pause_event.set()
 
@@ -486,10 +532,110 @@ class TrainingWorker(QThread):
             completed_epoch_steps = 0
             epoch_durations = []
 
+            def compute_stratified_split_size(total_count, num_classes, base_test_size):
+                if base_test_size < 1:
+                    desired = int(round(base_test_size * total_count))
+                else:
+                    desired = int(base_test_size)
+                desired = max(desired, num_classes)
+                max_allowed = total_count - num_classes
+                if max_allowed < num_classes:
+                    raise RuntimeError(
+                        "Need at least 2 patients per class for stratified train/test split."
+                    )
+                return min(desired, max_allowed)
+
             labels_np = self.label_tensor.cpu().numpy()
             all_indices = np.arange(len(labels_np))
 
-            if self.multi_label:
+            if self.split_by_patient:
+                if self.multi_label:
+                    raise RuntimeError("Patient-level splitting is not supported for Task III.")
+                if self.patient_ids is None:
+                    raise RuntimeError("Patient IDs are required for patient-level splitting.")
+
+                patient_ids_np = np.asarray(self.patient_ids)
+                if len(patient_ids_np) != len(labels_np):
+                    raise RuntimeError("Patient IDs length does not match label tensor length.")
+
+                patient_to_label = {}
+                patient_to_indices = {}
+                for idx, patient_id in enumerate(patient_ids_np):
+                    if patient_id not in patient_to_indices:
+                        patient_to_indices[patient_id] = []
+                    patient_to_indices[patient_id].append(idx)
+                    if patient_id not in patient_to_label:
+                        patient_to_label[patient_id] = int(labels_np[idx])
+
+                patients = np.array(list(patient_to_label.keys()))
+                patient_labels = np.array([patient_to_label[pid] for pid in patients])
+                class_name_map = self.class_names or [str(i) for i in range(self.num_classes)]
+                unique_patients, patient_counts = np.unique(patient_labels, return_counts=True)
+                patient_class_counts = {
+                    class_name_map[int(label)]: int(count)
+                    for label, count in zip(unique_patients, patient_counts)
+                }
+                self.log_update.emit(
+                    f"Patient-level class counts (all patients): {patient_class_counts}"
+                )
+
+                unique_classes, class_freq = np.unique(patient_labels, return_counts=True)
+                if len(unique_classes) < 2:
+                    raise RuntimeError("Need at least two classes for patient-level stratified split.")
+                if np.min(class_freq) < 2:
+                    raise RuntimeError("At least one class has fewer than 2 patients; cannot perform stratified 80/20 split.")
+
+                test_size = compute_stratified_split_size(
+                    len(patients),
+                    len(unique_classes),
+                    self.test_size,
+                )
+                train_patients, test_patients = train_test_split(
+                    patients,
+                    test_size=test_size,
+                    random_state=self.random_state,
+                    shuffle=True,
+                    stratify=patient_labels,
+                )
+
+                train_patient_labels = np.array([patient_to_label[pid] for pid in train_patients])
+                unique_train_labels, train_patient_counts = np.unique(train_patient_labels, return_counts=True)
+                train_class_counts = {
+                    class_name_map[int(label)]: int(count)
+                    for label, count in zip(unique_train_labels, train_patient_counts)
+                }
+                self.log_update.emit(
+                    f"Patient-level class counts (train split): {train_class_counts}"
+                )
+                unique_train, train_freq = np.unique(train_patient_labels, return_counts=True)
+                if self.n_splits <= 1:
+                    if np.min(train_freq) < 2:
+                        underfilled = {
+                            class_name_map[int(label)]: int(count)
+                            for label, count in zip(unique_train, train_freq)
+                            if count < 2
+                        }
+                        raise RuntimeError(
+                            "Need at least 2 patients per class in training split for stratified train/val split. "
+                            f"Minimum class count is {np.min(train_freq)}. "
+                            f"Classes below threshold: {underfilled}."
+                        )
+                elif np.min(train_freq) < self.n_splits:
+                    underfilled = {
+                        class_name_map[int(label)]: int(count)
+                        for label, count in zip(unique_train, train_freq)
+                        if count < self.n_splits
+                    }
+                    raise RuntimeError(
+                        f"Need at least {self.n_splits} patients per class in training split for StratifiedKFold. "
+                        f"Minimum class count is {np.min(train_freq)}. "
+                        f"Classes below threshold: {underfilled}."
+                    )
+
+                train_idx = np.concatenate([patient_to_indices[pid] for pid in train_patients]).astype(int)
+                test_idx = np.concatenate([patient_to_indices[pid] for pid in test_patients]).astype(int)
+                splitter = None
+            elif self.multi_label:
                 if len(labels_np) < 2:
                     raise RuntimeError("Need at least two samples for train/test split.")
                 train_idx, test_idx = train_test_split(
@@ -528,7 +674,15 @@ class TrainingWorker(QThread):
                     )
                 splitter = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
 
-            self.log_update.emit(f"80/20 split done: train={len(train_idx)} samples, test={len(test_idx)} samples")
+            if self.split_by_patient:
+                train_patient_count = len(np.unique(np.asarray(self.patient_ids)[train_idx]))
+                test_patient_count = len(np.unique(np.asarray(self.patient_ids)[test_idx]))
+                self.log_update.emit(
+                    f"80/20 split done (patient-level): train={len(train_idx)} samples ({train_patient_count} patients), "
+                    f"test={len(test_idx)} samples ({test_patient_count} patients)"
+                )
+            else:
+                self.log_update.emit(f"80/20 split done: train={len(train_idx)} samples, test={len(test_idx)} samples")
 
             x_test = self.x_tensor[test_idx]
             y_test = self.y_tensor[test_idx]
@@ -552,10 +706,56 @@ class TrainingWorker(QThread):
             best_fold = -1
             best_state_dict = None
 
-            for fold_idx, (fold_train_rel, fold_val_rel) in enumerate(splitter.split(train_idx, train_labels), start=1):
+            if self.split_by_patient:
+                patient_ids_np = np.asarray(self.patient_ids)
+                patient_to_indices = {}
+                for idx, patient_id in enumerate(patient_ids_np):
+                    patient_to_indices.setdefault(patient_id, []).append(idx)
+                train_patients = np.unique(patient_ids_np[train_idx])
+                train_patient_labels = np.array([int(labels_np[patient_ids_np == pid][0]) for pid in train_patients])
+
+                if self.n_splits <= 1:
+                    val_size = compute_stratified_split_size(
+                        len(train_patients),
+                        len(np.unique(train_patient_labels)),
+                        self.test_size,
+                    )
+                    fold_train_patients, fold_val_patients = train_test_split(
+                        train_patients,
+                        test_size=val_size,
+                        random_state=self.random_state,
+                        shuffle=True,
+                        stratify=train_patient_labels,
+                    )
+                    split_iter = [(fold_train_patients, fold_val_patients)]
+                else:
+                    splitter = StratifiedKFold(
+                        n_splits=self.n_splits,
+                        shuffle=True,
+                        random_state=self.random_state,
+                    )
+                    split_iter = splitter.split(train_patients, train_patient_labels)
+            else:
+                split_iter = splitter.split(train_idx, train_labels)
+
+            for fold_idx, (fold_train_rel, fold_val_rel) in enumerate(split_iter, start=1):
                 self.wait_if_paused()
-                fold_train_idx = train_idx[fold_train_rel]
-                fold_val_idx = train_idx[fold_val_rel]
+                if self.split_by_patient:
+                    if self.n_splits <= 1:
+                        fold_train_patients = fold_train_rel
+                        fold_val_patients = fold_val_rel
+                    else:
+                        fold_train_patients = train_patients[fold_train_rel]
+                        fold_val_patients = train_patients[fold_val_rel]
+                    fold_train_idx = np.concatenate(
+                        [patient_to_indices[pid] for pid in fold_train_patients]
+                    ).astype(int)
+                    fold_val_idx = np.concatenate(
+                        [patient_to_indices[pid] for pid in fold_val_patients]
+                    ).astype(int)
+                else:
+                    fold_train_idx = train_idx[fold_train_rel]
+                    fold_val_idx = train_idx[fold_val_rel]
 
                 x_train = self.x_tensor[fold_train_idx]
                 y_train = self.y_tensor[fold_train_idx]
@@ -684,6 +884,13 @@ class TrainingWorker(QThread):
                 'test_acc': test_acc,
                 'train_size': int(len(train_idx)),
                 'test_size': int(len(test_idx)),
+                'test_tensors': {
+                    'x': x_test.detach().cpu(),
+                    'y': y_test.detach().cpu(),
+                    'z': z_test.detach().cpu(),
+                    'labels': label_test.detach().cpu(),
+                },
+                'test_class_names': self.class_names,
             })
         except Exception as exc:
             self.error_update.emit(str(exc))
@@ -721,6 +928,9 @@ class HVDMainWindow(QMainWindow):
         self.loaded_model_classes = None
         self.dataset_class_summary_cache = None
         self.last_inference_result = None
+        self.last_test_tensors = None
+        self.last_test_task_name = None
+        self.last_test_class_names = None
         self.is_training_paused = False
         self.current_num_epochs = 100
         self.current_n_splits = 5
@@ -764,7 +974,7 @@ class HVDMainWindow(QMainWindow):
         self.patient_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.patient_input.setToolTip("Select a patient from the available cleaned files")
         self.task_selector = QComboBox()
-        self.task_selector.addItems(["Task I", "Task II", "Task III"])
+        self.task_selector.addItems(["Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"])
         self.task_selector.currentTextChanged.connect(self.on_task_changed)
         self.annotation_selector = QComboBox()
         self.annotation_selector.addItems(["ECG R-peaks", "AO peaks (Saved_Peaks)"])
@@ -792,6 +1002,11 @@ class HVDMainWindow(QMainWindow):
         self.small_training_mode = QComboBox()
         self.small_training_mode.addItems(["Full training (5-fold, 100 epochs)", "Small training (3-fold, 50 epochs)"])
         self.small_training_mode.setToolTip("Use fewer folds and epochs for quicker iteration.")
+        self.balance_classes_checkbox = QCheckBox("Balance classes (cap patients at 2x smallest)")
+        self.balance_classes_checkbox.setToolTip("Limits patients per class for Task I, Task I (MS+AR), Task I (AS+MR), and Task II.")
+        self.balance_classes_checkbox.setChecked(True)
+        self.patient_split_checkbox = QCheckBox("Split by patient (Task I / Task I (MS+AR) / Task I (AS+MR))")
+        self.patient_split_checkbox.setToolTip("Keep all segments from a patient in the same split for Task I, Task I (MS+AR), and Task I (AS+MR).")
         self.pause_resume_btn = QPushButton("Pause Training")
         self.pause_resume_btn.clicked.connect(self.step_toggle_training_pause)
         self.load_model_btn = QPushButton("Load Saved\nModel")
@@ -864,6 +1079,8 @@ class HVDMainWindow(QMainWindow):
         input_layout.addWidget(self.step7_btn)
         input_layout.addWidget(self.step8_btn)
         input_layout.addWidget(self.small_training_mode)
+        input_layout.addWidget(self.balance_classes_checkbox)
+        input_layout.addWidget(self.patient_split_checkbox)
         input_layout.addWidget(self.step9_btn)
         input_layout.addWidget(self.pause_resume_btn)
         input_layout.addWidget(self.load_model_btn)
@@ -1038,6 +1255,7 @@ class HVDMainWindow(QMainWindow):
         self.refresh_class_attention_class_selector()
         self.update_step_controls()
         self.update_navigation_controls()
+        self.patient_split_checkbox.setEnabled(self.task_selector.currentText() in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"))
 
     def log(self, message):
         self.console.append(message)
@@ -1062,6 +1280,16 @@ class HVDMainWindow(QMainWindow):
     def on_task_changed(self, task_name):
         self.refresh_class_attention_class_selector()
         self.populate_patient_dropdown(task_name)
+        if hasattr(self, 'patient_split_checkbox'):
+            is_task1 = task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)")
+            self.patient_split_checkbox.setEnabled(is_task1)
+            if not is_task1:
+                self.patient_split_checkbox.setChecked(False)
+        if hasattr(self, 'balance_classes_checkbox'):
+            supports_balance = task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
+            self.balance_classes_checkbox.setEnabled(supports_balance)
+            if not supports_balance:
+                self.balance_classes_checkbox.setChecked(False)
 
     def format_patient_condition_text(self, label_row):
         if not isinstance(label_row, dict):
@@ -1106,7 +1334,7 @@ class HVDMainWindow(QMainWindow):
         for csv_path in csv_paths:
             patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
             label_row = label_lookup.get(patient_id)
-            if task_name in ("Task I", "Task II") and not self.is_patient_eligible_for_task(label_row, task_name):
+            if task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II") and not self.is_patient_eligible_for_task(label_row, task_name):
                 continue
             condition_text = self.format_patient_condition_text(label_row)
             display_text = f"{patient_id} - {condition_text}"
@@ -1173,7 +1401,7 @@ class HVDMainWindow(QMainWindow):
             'tasks': {}
         }
 
-        for task_name in ("Task I", "Task II", "Task III"):
+        for task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"):
             class_names = self.loader.get_task_class_names(task_name)
             class_counts = np.zeros(len(class_names), dtype=np.int64)
             excluded_by_definition = 0
@@ -1671,9 +1899,9 @@ class HVDMainWindow(QMainWindow):
         z_tensor = torch.tensor(self.current_data['pytorch_inputs']['AccZ'], dtype=torch.float32)
 
         self.scnn_models = {
-            'x': SCNN_Module(in_channels=1, base_filters=64, kernel_size=7),
-            'y': SCNN_Module(in_channels=1, base_filters=64, kernel_size=7),
-            'z': SCNN_Module(in_channels=1, base_filters=64, kernel_size=7)
+            'x': SCNN_Module(in_channels=1, base_filters=64, kernel_sizes=(7, 7, 3)),
+            'y': SCNN_Module(in_channels=1, base_filters=64, kernel_sizes=(7, 7, 3)),
+            'z': SCNN_Module(in_channels=1, base_filters=64, kernel_sizes=(7, 7, 3))
         }
 
         for model in self.scnn_models.values():
@@ -1821,7 +2049,7 @@ class HVDMainWindow(QMainWindow):
         self.log(f" > attention_z shape: {tuple(attn_z.shape)}")
         self.log(f" > Active task: {task_name} | Classes: {class_names}")
 
-    def build_training_dataset(self, task_name):
+    def build_training_dataset(self, task_name, balance_classes=True):
         class_names = self.loader.get_task_class_names(task_name)
 
         csv_paths = sorted(glob.glob(os.path.join(self.loader.data_dir, "Cleaned_*.csv")))
@@ -1832,13 +2060,54 @@ class HVDMainWindow(QMainWindow):
         y_samples = []
         z_samples = []
         labels = []
+        patient_ids = []
         skipped_by_task = 0
         skipped_no_segments = 0
         skipped_errors = 0
+        skipped_by_balance = 0
         class_counts = np.zeros(len(class_names), dtype=np.int64)
+
+        balanced_patient_ids = None
+        balance_max_per_class = None
+        if balance_classes and task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II"):
+            labels_path = os.path.join(self.loader.data_dir, "ground_truth_labels.csv")
+            if os.path.exists(labels_path):
+                df_labels = pd.read_csv(labels_path, sep=',')
+                df_labels.columns = df_labels.columns.str.strip()
+                label_rows = {
+                    row['Patient ID']: row.to_dict()
+                    for _, row in df_labels.iterrows()
+                }
+                class_to_patients = {idx: [] for idx in range(len(class_names))}
+                for csv_path in csv_paths:
+                    patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
+                    label_row = label_rows.get(patient_id)
+                    if label_row is None:
+                        continue
+                    class_index = self.loader.map_label_row_to_task_index(label_row, task_name)
+                    if class_index is None:
+                        continue
+                    class_to_patients[int(class_index)].append(patient_id)
+
+                present_counts = [len(patients) for patients in class_to_patients.values() if patients]
+                if present_counts:
+                    min_count = min(present_counts)
+                    balance_max_per_class = max(1, 2 * int(min_count))
+                    rng = np.random.default_rng(42)
+                    selected = set()
+                    for patients in class_to_patients.values():
+                        if len(patients) <= balance_max_per_class:
+                            selected.update(patients)
+                        else:
+                            chosen = rng.choice(patients, size=balance_max_per_class, replace=False)
+                            selected.update(chosen.tolist())
+                    balanced_patient_ids = selected
 
         for csv_path in csv_paths:
             patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
+            if balanced_patient_ids is not None and patient_id not in balanced_patient_ids:
+                skipped_by_balance += 1
+                continue
             try:
                 patient_data = self.loader.load_patient_data(
                     patient_id,
@@ -1893,6 +2162,7 @@ class HVDMainWindow(QMainWindow):
                     x_samples.append(torch.tensor(seg_x, dtype=torch.float32).unsqueeze(0))
                     y_samples.append(torch.tensor(seg_y, dtype=torch.float32).unsqueeze(0))
                     z_samples.append(torch.tensor(seg_z, dtype=torch.float32).unsqueeze(0))
+                    patient_ids.append(patient_id)
                     if task_name == "Task III":
                         labels.append(torch.tensor(label_value, dtype=torch.float32))
                         class_counts += label_value.astype(np.int64)
@@ -1919,11 +2189,14 @@ class HVDMainWindow(QMainWindow):
             'y_tensor': y_tensor,
             'z_tensor': z_tensor,
             'label_tensor': label_tensor,
+            'patient_ids': patient_ids,
             'num_samples': len(label_tensor),
             'class_counts': class_counts,
             'skipped_by_task': skipped_by_task,
             'skipped_no_segments': skipped_no_segments,
             'skipped_errors': skipped_errors,
+            'skipped_by_balance': skipped_by_balance,
+            'balance_max_per_class': balance_max_per_class,
             'class_names': class_names,
         }
 
@@ -1939,7 +2212,7 @@ class HVDMainWindow(QMainWindow):
                 f"Labeled: {summary['labeled_patients']} | "
                 f"Missing label rows: {summary['missing_label_rows']}"
             )
-            for task_name in ("Task I", "Task II", "Task III"):
+            for task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"):
                 task_info = summary['tasks'][task_name]
                 class_parts = [
                     f"{name}={count}"
@@ -1948,6 +2221,10 @@ class HVDMainWindow(QMainWindow):
                 extra_parts = []
                 if task_name == "Task III":
                     extra_parts.append(f"Normal={task_info['normal_count']}")
+                elif task_name == "Task I (MS+AR)":
+                    extra_parts.append("Normal ignored")
+                elif task_name == "Task I (AS+MR)":
+                    extra_parts.append("Normal ignored")
                 self.log(
                     f" > {task_name}: "
                     + ", ".join(class_parts)
@@ -1960,11 +2237,32 @@ class HVDMainWindow(QMainWindow):
 
             task_name = self.task_selector.currentText()
             self.current_training_task = task_name
-            dataset_info = self.build_training_dataset(task_name)
+            balance_classes = (
+                task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
+                and hasattr(self, 'balance_classes_checkbox')
+                and self.balance_classes_checkbox.isChecked()
+            )
+            dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
+
+            split_by_patient = (
+                task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)")
+                and hasattr(self, 'patient_split_checkbox')
+                and self.patient_split_checkbox.isChecked()
+            )
+            if task_name not in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)") and hasattr(self, 'patient_split_checkbox') and self.patient_split_checkbox.isChecked():
+                self.log("[INFO] Patient-level split is only supported for Task I, Task I (MS+AR), and Task I (AS+MR). Using segment-level split.")
+                split_by_patient = False
 
             is_small_training = self.small_training_mode.currentIndex() == 1
-            num_epochs = 50 if is_small_training else 100
-            n_splits = 3 if is_small_training else 5
+            if task_name in ("Task I (MS+AR)", "Task I (AS+MR)"):
+                num_epochs = 50
+                n_splits = 2
+            elif split_by_patient:
+                num_epochs = 100
+                n_splits = 1
+            else:
+                num_epochs = 50 if is_small_training else 100
+                n_splits = 3 if is_small_training else 5
             self.current_num_epochs = num_epochs
             self.current_n_splits = n_splits
 
@@ -1974,6 +2272,12 @@ class HVDMainWindow(QMainWindow):
             self.log(f" > Total samples: {dataset_info['num_samples']}")
             self.log(f" > Class counts: {dataset_info['class_counts'].tolist()}")
             self.log(f" > Skipped rows excluded by task definition: {dataset_info['skipped_by_task']}")
+            if dataset_info.get('balance_max_per_class') is not None:
+                self.log(
+                    " > Patient balancing: max per class="
+                    f"{dataset_info['balance_max_per_class']} (2x smallest class)"
+                )
+                self.log(f" > Skipped by patient balancing: {dataset_info['skipped_by_balance']}")
             self.log(f" > Skipped patients with no segments: {dataset_info['skipped_no_segments']}")
             self.log(f" > Skipped errors: {dataset_info['skipped_errors']}")
             self.training_worker = TrainingWorker(
@@ -1991,6 +2295,9 @@ class HVDMainWindow(QMainWindow):
                 n_splits=n_splits,
                 random_state=42,
                 multi_label=(task_name == "Task III"),
+                patient_ids=dataset_info.get('patient_ids'),
+                split_by_patient=split_by_patient,
+                class_names=dataset_info.get('class_names'),
             )
             self.training_worker.log_update.connect(self.log)
             self.training_worker.epoch_update.connect(self.on_training_epoch_update)
@@ -2003,6 +2310,12 @@ class HVDMainWindow(QMainWindow):
             self.log("[INFO] Training started in a background thread to keep the UI responsive.")
             if task_name == "Task III":
                 self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold KFold on train pool.")
+            elif split_by_patient:
+                self.log(
+                    "[INFO] Split strategy: patient-level 80/20 stratified split, then a single stratified train/val split (no CV)."
+                )
+            elif task_name in ("Task I (MS+AR)", "Task I (AS+MR)"):
+                self.log("[INFO] Split strategy: 80% train pool / 20% held-out test, then 2-fold stratified CV on train pool.")
             else:
                 self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold stratified CV on train pool.")
             self.update_step_controls()
@@ -2046,6 +2359,9 @@ class HVDMainWindow(QMainWindow):
     def on_training_finished(self, summary):
         self.is_training_paused = False
         self.last_training_summary = summary
+        self.last_test_tensors = summary.get('test_tensors')
+        self.last_test_task_name = self.current_training_task
+        self.last_test_class_names = summary.get('test_class_names')
         self.hvdnet_model = HVDNet(num_classes=5, d=64)
         self.hvdnet_model.load_state_dict(summary['best_state_dict'])
         self.loaded_model_task = self.current_training_task
@@ -2128,7 +2444,10 @@ class HVDMainWindow(QMainWindow):
 
         self.loaded_model_task = task_name
         self.loaded_model_classes = class_names
-        if task_name in ["Task I", "Task II", "Task III"]:
+        self.last_test_tensors = None
+        self.last_test_task_name = None
+        self.last_test_class_names = None
+        if task_name in ["Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"]:
             self.task_selector.setCurrentText(task_name)
         self.refresh_class_attention_class_selector()
 
@@ -2138,7 +2457,12 @@ class HVDMainWindow(QMainWindow):
         self.update_step_controls()
 
     def get_task_test_split_tensors(self, task_name):
-        dataset_info = self.build_training_dataset(task_name)
+        balance_classes = (
+            task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
+            and hasattr(self, 'balance_classes_checkbox')
+            and self.balance_classes_checkbox.isChecked()
+        )
+        dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
         x_tensor = dataset_info['x_tensor']
         y_tensor = dataset_info['y_tensor']
         z_tensor = dataset_info['z_tensor']
@@ -2527,7 +2851,15 @@ class HVDMainWindow(QMainWindow):
         task_name = self.loaded_model_task or self.task_selector.currentText()
         is_multilabel = task_name == "Task III"
         try:
-            x_test, y_test, z_test, y_true, class_names = self.get_task_test_split_tensors(task_name)
+            use_cached_test = self.last_test_tensors is not None and self.last_test_task_name == task_name
+            if use_cached_test:
+                x_test = self.last_test_tensors['x']
+                y_test = self.last_test_tensors['y']
+                z_test = self.last_test_tensors['z']
+                y_true = self.last_test_tensors['labels']
+                class_names = self.last_test_class_names or self.loader.get_task_class_names(task_name)
+            else:
+                x_test, y_test, z_test, y_true, class_names = self.get_task_test_split_tensors(task_name)
 
             test_loader = DataLoader(
                 TensorDataset(x_test, y_test, z_test, y_true),
@@ -2621,6 +2953,23 @@ class HVDMainWindow(QMainWindow):
                     average='weighted',
                     zero_division=0,
                 )
+                per_class_precision, per_class_recall, per_class_f1, _ = precision_recall_fscore_support(
+                    targets,
+                    preds,
+                    labels=list(range(len(class_names))),
+                    average=None,
+                    zero_division=0,
+                )
+                cm = np.asarray(cm, dtype=float)
+                per_class_accuracy = []
+                total_samples = float(np.sum(cm))
+                for idx in range(len(class_names)):
+                    tp = cm[idx, idx]
+                    fn = np.sum(cm[idx, :]) - tp
+                    fp = np.sum(cm[:, idx]) - tp
+                    tn = total_samples - tp - fn - fp
+                    denom = tp + tn + fp + fn
+                    per_class_accuracy.append((tp + tn) / denom if denom > 0 else 0.0)
 
                 self.log(f"[CONFUSION MATRIX] Task={task_name}")
                 self.log(f" > Test samples: {len(targets)}")
@@ -2633,11 +2982,24 @@ class HVDMainWindow(QMainWindow):
                     f"F1={f1_macro * 100:.2f}%"
                 )
                 self.log(
+                    " > Unweighted (macro) per-class: "
+                    f"Accuracy={np.mean(per_class_accuracy) * 100:.2f}% | "
+                    f"Precision={np.mean(per_class_precision) * 100:.2f}% | "
+                    f"Recall={np.mean(per_class_recall) * 100:.2f}% | "
+                    f"F1={np.mean(per_class_f1) * 100:.2f}%"
+                )
+                self.log(
                     " > Metrics (weighted): "
                     f"Precision={precision_weighted * 100:.2f}% | "
                     f"Recall={recall_weighted * 100:.2f}% | "
                     f"F1={f1_weighted * 100:.2f}%"
                 )
+                for idx, class_name in enumerate(class_names):
+                    self.log(
+                        f" > {class_name}: Acc={per_class_accuracy[idx] * 100:.2f}% | "
+                        f"Rec={per_class_recall[idx] * 100:.2f}% | "
+                        f"F1={per_class_f1[idx] * 100:.2f}%"
+                    )
                 self.log(f" > Matrix:\n{cm}")
         except Exception as e:
             self.log(f"[ERROR] Confusion matrix generation failed: {str(e)}")
