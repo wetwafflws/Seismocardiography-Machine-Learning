@@ -30,3 +30,5 @@ Thumbs.db
 *.python-version
 # PyTorch models (optional - uncomment if you want to exclude)
 # *.pt
+
+CEBS_Data/

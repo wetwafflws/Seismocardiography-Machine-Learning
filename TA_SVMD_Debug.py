@@ -50,7 +50,7 @@ st.set_page_config(page_title="CEBS Data Viewer & Replication", layout="wide")
 # 1. ALGORITHM IMPLEMENTATION (SVMD)
 # ==========================================
 
-def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=1, init_omega=0):
+def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=3, init_omega=0):
     """
     Successive Variational Mode Decomposition (SVMD)
     A drop-in Python replacement corresponding to the original MATLAB script.
@@ -64,7 +64,11 @@ def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=1, init_omega=0):
     signoise = signal_in - y
     
     save_T = len(signal_in)
-    fs = 1.0 / save_T
+    # BUG FIX: SVMD operates in normalised frequency domain [0, 0.5].
+    # fs here is the *normalised* sampling frequency = 1.0, not 1/N.
+    # Using 1/save_T produced a near-zero fs that made random omega_L
+    # initialisation (init_omega != 0) always land at almost-zero frequency.
+    fs = 1.0
     
     # Mirror the signal and noise to extend (Part 1)
     T_half = save_T // 2
@@ -160,13 +164,21 @@ def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=1, init_omega=0):
                 else:
                     omega_L[n+1] = omega_L[n]
                     
-                # Update lambda (dual ascent)
+                # Update lambda (dual ascent) — paper eq. 18
+                # u_r^{n+1} = [alpha^2*(w-wk)^4 * (f - u_k - sum_prev + lam/2)] / [1 + alpha^2*(w-wk)^4]
+                #            + sum_prev_ui
+                # lambda^{n+1} = lambda^n + tau * (f - u_k^{n+1} - u_r^{n+1})
+                # BUG FIX: previous code subtracted sum_u_i inside num_tau AND added it
+                # outside, which double-counted it with the wrong sign.
                 term1 = alpha_sq * freq_diff_pow4
                 inner_paren = f_hat_onesided - u_hat_L[n+1, :] - sum_u_i + lambda_arr[n, :] / 2.0
-                num_tau = term1 * inner_paren - sum_u_i
+                # u_r numerator term (without the +sum_u_i part)
+                num_tau = term1 * inner_paren
                 den_tau = 1 + term1
+                # Full u_r^{n+1} = num_tau/den_tau + sum_u_i
+                u_r_updated = num_tau / den_tau + sum_u_i
                 
-                lambda_arr[n+1, :] = lambda_arr[n, :] + tau * (f_hat_onesided - (u_hat_L[n+1, :] + num_tau / den_tau) + sum_u_i)
+                lambda_arr[n+1, :] = lambda_arr[n, :] + tau * (f_hat_onesided - u_hat_L[n+1, :] - u_r_updated)
                 
                 # Update criteria
                 udiff = np.finfo(float).eps
@@ -295,8 +307,13 @@ def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=1, init_omega=0):
     u_hat = np.zeros((T, L), dtype=complex)
     
     for idx in range(L):
+        # Positive frequency half (including DC=0 and Nyquist=T//2)
         u_hat[T//2:T, idx] = u_hat_Temp[idx][T//2:T]
-        u_hat[T//2:0:-1, idx] = np.conj(u_hat_Temp[idx][T//2:T])
+        # BUG FIX: negative frequency half via Hermitian symmetry.
+        # Correct mapping: u_hat[k] = conj(u_hat[T-k]) for k = 1 … T//2-1.
+        # Previous code used u_hat[T//2:0:-1] which started at T//2 and thereby
+        # overwrote the Nyquist bin with its own conjugate before the IFFT.
+        u_hat[1:T//2, idx] = np.conj(u_hat_Temp[idx][T//2+1:T][::-1])
         u_hat[0, idx] = np.conj(u_hat[-1, idx])
         
     u = np.zeros((L, T))
@@ -413,7 +430,7 @@ def load_unhealthy_patient_data(patient_id, base_dir, target_fs=256):
     signals[:, 0] = df_full["ecg_filt"].to_numpy()
     signals[:, 3] = df_full["scg_z_norm"].to_numpy()
 
-    return signals, r_peak_indices, target_fs
+    return signals, r_peak_indices, r_peaks_seconds, target_fs
 
 def apply_mti_filter(raw_signal):
     def mti_pass(sig, beta):
@@ -601,7 +618,7 @@ def build_sample_bad_mask(signal_len, sqa_result):
 # 3. WAVEFORM FACTOR & RECONSTRUCTION
 # ==========================================
 
-def select_ao_modes(modes, omegas=None, fs=None, freq_cutoff_hz=50):
+def select_ao_modes(modes, omegas=None, fs=None, freq_cutoff_hz=100):
     wfs = []
     for mode in modes:
         rms = np.sqrt(np.mean(mode**2))
@@ -641,7 +658,11 @@ def extract_ao_peaks(s_ao, fs, prominence_factor=0.05, power=7):
     s_ao_tapered = s_ao * taper_window
     
     # 1. Power Law Detection (using the tapered signal)
-    s_ao_7 = np.power(s_ao_tapered, power)
+    # BUG FIX: np.power(x, p) returns NaN for negative x when p is non-integer
+    # (e.g. if user sets power slider to a float-like value via future edits).
+    # Use sign-preserving formulation: sign(x)*|x|^p, which is also the
+    # physically meaningful operation (amplify magnitude, keep polarity).
+    s_ao_7 = np.sign(s_ao_tapered) * np.abs(s_ao_tapered) ** power
     
     # 2. Envelope extraction via Hilbert Transform
     analytic_signal = signal.hilbert(s_ao_7)
@@ -654,7 +675,11 @@ def extract_ao_peaks(s_ao, fs, prominence_factor=0.05, power=7):
     # 4. Detect Peaks
     min_distance = int(0.4 * fs)
     # Dynamic prominence threshold
-    peaks, _ = find_peaks(smoothed_env, distance=min_distance, prominence=np.max(smoothed_env)*prominence_factor)
+    prom_threshold = max(
+        np.percentile(smoothed_env, 90) * prominence_factor,
+        np.percentile(smoothed_env, 10),
+    )
+    peaks, _ = find_peaks(smoothed_env, distance=min_distance, prominence=prom_threshold)
     
     return s_ao_7, envelope, smoothed_env, peaks
 
@@ -699,6 +724,19 @@ def detect_r_peaks(ecg_signal, fs):
     min_distance = int(0.4 * fs_working)  # Minimum 0.4s between R peaks
     
     r_peaks, _ = find_peaks(ecg_integrated, height=threshold, distance=min_distance)
+
+    # Refinement: snap each detected peak to the true R-wave maximum
+    # in the filtered ECG within a +/-50 ms search window.
+    search_radius = int(0.05 * fs_working)
+    refined_peaks = []
+    for pk in r_peaks:
+        lo = max(0, pk - search_radius)
+        hi = min(len(ecg_filtered), pk + search_radius)
+        if hi <= lo:
+            continue
+        local_max = lo + np.argmax(ecg_filtered[lo:hi])
+        refined_peaks.append(local_max)
+    r_peaks = np.array(refined_peaks, dtype=int)
     
     # Scale peak indices back to original sampling rate if downsampled
     if fs > 1000:
@@ -715,46 +753,170 @@ def compare_intervals(ao_peaks, r_peaks, fs):
     """
     if len(ao_peaks) < 2 or len(r_peaks) < 2:
         return None
-    
-    # Calculate intervals in milliseconds
-    ao_intervals_ms = np.diff(ao_peaks) / fs * 1000
-    rr_intervals_ms = np.diff(r_peaks) / fs * 1000
-    
-    # Calculate heart rates
+
+    ao_intervals_ms, rr_intervals_ms, ao_centers_s, rr_centers_s = match_intervals_by_time(
+        ao_peaks, r_peaks, fs
+    )
+    if len(ao_intervals_ms) == 0:
+        return None
+
+    # Calculate heart rates (BPM)
     ao_hr = 60000 / ao_intervals_ms
     rr_hr = 60000 / rr_intervals_ms
-    
-    # Match intervals (use minimum length)
-    min_len = min(len(ao_intervals_ms), len(rr_intervals_ms))
-    ao_intervals_ms = ao_intervals_ms[:min_len]
-    rr_intervals_ms = rr_intervals_ms[:min_len]
-    ao_hr = ao_hr[:min_len]
-    rr_hr = rr_hr[:min_len]
-    
+
     # Compute statistics
-    correlation = np.corrcoef(ao_intervals_ms, rr_intervals_ms)[0, 1]
+    correlation = np.corrcoef(ao_intervals_ms, rr_intervals_ms)[0, 1] if len(ao_intervals_ms) > 1 else np.nan
     rmse = np.sqrt(np.mean((ao_intervals_ms - rr_intervals_ms)**2))
     mae = np.mean(np.abs(ao_intervals_ms - rr_intervals_ms))
-    
+
     # Bland-Altman statistics
     mean_intervals = (ao_intervals_ms + rr_intervals_ms) / 2
     diff_intervals = ao_intervals_ms - rr_intervals_ms
     mean_diff = np.mean(diff_intervals)
     std_diff = np.std(diff_intervals)
-    
+
+    paper_metrics = compute_paper_metrics(ao_intervals_ms, rr_intervals_ms)
+
     return {
-        'ao_intervals_ms': ao_intervals_ms,
-        'rr_intervals_ms': rr_intervals_ms,
-        'ao_hr': ao_hr,
-        'rr_hr': rr_hr,
-        'correlation': correlation,
-        'rmse': rmse,
-        'mae': mae,
-        'mean_diff': mean_diff,
-        'std_diff': std_diff,
-        'mean_intervals': mean_intervals,
-        'diff_intervals': diff_intervals
+        "ao_intervals_ms": ao_intervals_ms,
+        "rr_intervals_ms": rr_intervals_ms,
+        "ao_hr": ao_hr,
+        "rr_hr": rr_hr,
+        "ao_centers_s": ao_centers_s,
+        "rr_centers_s": rr_centers_s,
+        "correlation": correlation,
+        "rmse": rmse,
+        "mae": mae,
+        "mean_diff": mean_diff,
+        "std_diff": std_diff,
+        "mean_intervals": mean_intervals,
+        "diff_intervals": diff_intervals,
+        "paper_metrics": paper_metrics,
     }
+
+
+def match_intervals_by_time(ao_peaks, r_peaks, fs):
+    """
+    Match AO-AO and R-R intervals by nearest interval-center timestamps.
+    """
+    ao_peaks = np.asarray(ao_peaks, dtype=float)
+    r_peaks = np.asarray(r_peaks, dtype=float)
+
+    if len(ao_peaks) < 2 or len(r_peaks) < 2:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    ao_intervals_ms = np.diff(ao_peaks) / fs * 1000.0
+    rr_intervals_ms = np.diff(r_peaks) / fs * 1000.0
+    ao_centers_s = (ao_peaks[:-1] + ao_peaks[1:]) / 2.0 / fs
+    rr_centers_s = (r_peaks[:-1] + r_peaks[1:]) / 2.0 / fs
+
+    if len(ao_centers_s) == 0 or len(rr_centers_s) == 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    median_rr_seconds = np.median(rr_intervals_ms) / 1000.0
+    if not np.isfinite(median_rr_seconds) or median_rr_seconds <= 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    max_time_diff = 0.5 * median_rr_seconds
+
+    matched_ao = []
+    matched_rr = []
+    matched_ao_centers = []
+    matched_rr_centers = []
+
+    for idx, ao_center in enumerate(ao_centers_s):
+        nearest_idx = int(np.argmin(np.abs(rr_centers_s - ao_center)))
+        time_diff = abs(rr_centers_s[nearest_idx] - ao_center)
+        if time_diff < max_time_diff:
+            matched_ao.append(ao_intervals_ms[idx])
+            matched_rr.append(rr_intervals_ms[nearest_idx])
+            matched_ao_centers.append(ao_center)
+            matched_rr_centers.append(rr_centers_s[nearest_idx])
+
+    return (
+        np.asarray(matched_ao, dtype=float),
+        np.asarray(matched_rr, dtype=float),
+        np.asarray(matched_ao_centers, dtype=float),
+        np.asarray(matched_rr_centers, dtype=float),
+    )
+
+
+def compute_paper_metrics(ao_intervals_ms, rr_intervals_ms):
+    """
+    Compute ARE, AAE, AAEP on BPM as defined in Zheng et al. (2024), eqs. 30-32.
+    """
+    ao_intervals_ms = np.asarray(ao_intervals_ms, dtype=float)
+    rr_intervals_ms = np.asarray(rr_intervals_ms, dtype=float)
+    if len(ao_intervals_ms) == 0 or len(rr_intervals_ms) == 0:
+        return None
+
+    ao_hr = 60000.0 / ao_intervals_ms
+    rr_hr = 60000.0 / rr_intervals_ms
+
+    mean_scg_hr = float(np.mean(ao_hr))
+    mean_ecg_hr = float(np.mean(rr_hr))
+    are = abs(mean_scg_hr - mean_ecg_hr) / mean_ecg_hr if mean_ecg_hr != 0 else np.nan
+    aae = float(np.mean(np.abs(ao_hr - rr_hr)))
+    aaep = float(np.mean(np.abs(ao_hr - rr_hr) / rr_hr) * 100.0)
+
+    return {
+        "ARE": are,
+        "AAE": aae,
+        "AAEP": aaep,
+        "mean_scg_hr": mean_scg_hr,
+        "mean_ecg_hr": mean_ecg_hr,
+    }
+
+
+def compute_detection_metrics(detected_peaks, reference_peaks, fs, tolerance_seconds=0.15):
+    """
+    Compute TP/FP/FN and detection metrics using greedy one-to-one matching.
+    """
+    detected = np.asarray(detected_peaks, dtype=float)
+    reference = np.asarray(reference_peaks, dtype=float)
+    tolerance_samples = float(tolerance_seconds) * fs
+    if len(reference) == 0:
+        return None
+
+    detected = np.sort(detected)
+    reference = np.sort(reference)
+    pep_min_samples = 0.03 * fs
+    pep_max_samples = 0.35 * fs
+
+    used = np.zeros(len(detected), dtype=bool)
+    tp = 0
+    fn = 0
+
+    for ref in reference:
+        candidates = np.where(
+            (~used)
+            & (detected - ref >= pep_min_samples)
+            & (detected - ref <= pep_max_samples)
+        )[0]
+        if len(candidates) == 0:
+            fn += 1
+            continue
+        closest_idx = candidates[np.argmin(np.abs(detected[candidates] - ref))]
+        used[closest_idx] = True
+        tp += 1
+
+    fp = int(np.sum(~used))
+
+    se = tp / (tp + fn) * 100.0 if (tp + fn) > 0 else np.nan
+    p = tp / (tp + fp) * 100.0 if (tp + fp) > 0 else np.nan
+    acc = tp / (tp + fp + fn) * 100.0 if (tp + fp + fn) > 0 else np.nan
+    der = (fp + fn) / (tp + fn) * 100.0 if (tp + fn) > 0 else np.nan
+
+    return {
+        "TP": tp,
+        "FP": fp,
+        "FN": fn,
+        "SE": se,
+        "P": p,
+        "ACC": acc,
+        "DER": der,
+    }
+
 
 # ==========================================
 # MAIN APP UI
@@ -970,7 +1132,7 @@ else:
 
         try:
             if is_unhealthy:
-                signals, r_peaks_indices, fs = load_unhealthy_patient_data(selected_record, base_dir)
+                signals, r_peaks_indices, r_peaks_seconds, fs = load_unhealthy_patient_data(selected_record, base_dir)
                 total_duration = len(signals) / fs
                 labels_df = load_unhealthy_labels(base_dir)
                 label_str = get_unhealthy_label_str(labels_df, selected_record)
@@ -990,7 +1152,7 @@ else:
 
     try:
         if is_unhealthy:
-            signals, r_peaks_indices, fs = load_unhealthy_patient_data(selected_record, base_dir)
+            signals, r_peaks_indices, r_peaks_seconds, fs = load_unhealthy_patient_data(selected_record, base_dir)
             labels_df = load_unhealthy_labels(base_dir)
             label_str = get_unhealthy_label_str(labels_df, selected_record)
             st.subheader(f"Patient Condition: {label_str}")
@@ -1376,6 +1538,20 @@ else:
                     st.metric("MAE", f"{comparison['mae']:.1f} ms")
                 with col4:
                     st.metric("Bias", f"{comparison['mean_diff']:.1f} ms")
+
+                paper_metrics = comparison.get("paper_metrics")
+                if paper_metrics:
+                    col5, col6, col7, col8, col9 = st.columns(5)
+                    with col5:
+                        st.metric("Mean SCG HR (BPM)", f"{paper_metrics['mean_scg_hr']:.1f}")
+                    with col6:
+                        st.metric("Mean ECG HR (BPM)", f"{paper_metrics['mean_ecg_hr']:.1f}")
+                    with col7:
+                        st.metric("ARE", f"{paper_metrics['ARE']:.3f}")
+                    with col8:
+                        st.metric("AAE (BPM)", f"{paper_metrics['AAE']:.2f}")
+                    with col9:
+                        st.metric("AAEP (%)", f"{paper_metrics['AAEP']:.2f}")
                 
                 # Bland-Altman Plot
                 st.markdown("#### Bland-Altman Plot")
@@ -1607,7 +1783,7 @@ else:
                 skipped_bad_windows = 0
                 
                 try:
-                    start_time = time.time()
+                    wall_clock_start = time.time()  # BUG FIX: renamed from start_time to avoid shadowing the slider variable
                     
                     for i in range(num_windows):
                         window_start = i * window_duration
@@ -1675,7 +1851,7 @@ else:
                                 all_rr_intervals_times.extend(rr_interval_times_w)
                     
                     end_time = time.time()
-                    elapsed_time = end_time - start_time
+                    elapsed_time = end_time - wall_clock_start
                     
                     status_text.text(f"Processing complete! Elapsed time: {elapsed_time:.2f} seconds")
                     progress_bar.progress(100)
@@ -1745,18 +1921,53 @@ else:
                     
                     # Calculate comparison statistics
                     if len(all_ao_peaks) > 1 and len(all_r_peaks) > 1:
-                        # First match intervals to same length
-                        min_len = min(len(all_ao_intervals), len(all_rr_intervals))
-                        all_ao_intervals = all_ao_intervals[:min_len]
-                        all_rr_intervals = all_rr_intervals[:min_len]
-                        all_ao_intervals_times = all_ao_intervals_times[:min_len]
-                        all_rr_intervals_times = all_rr_intervals_times[:min_len]
-                        
+                        # Use JSON-provided R peaks for unhealthy dataset
+                        if is_unhealthy and "r_peaks_seconds" in locals() and len(r_peaks_seconds) > 1:
+                            r_peaks_ref = (r_peaks_seconds * fs_proc_full).astype(int)
+                            all_r_peaks = r_peaks_ref
+                            all_rr_intervals = np.diff(all_r_peaks) / fs_proc_full * 1000.0
+                            all_rr_intervals_times = (all_r_peaks[:-1] + all_r_peaks[1:]) / 2.0 / fs_proc_full
+                        else:
+                            r_peaks_ref = np.array(all_r_peaks, dtype=int)
+
+                        ao_intervals_matched, rr_intervals_matched, ao_centers_s, rr_centers_s = match_intervals_by_time(
+                            all_ao_peaks, r_peaks_ref, fs_proc_full
+                        )
+
+                        # Filter matched intervals from bad SQA segments
+                        if sample_bad_mask_full_record is not None and show_sqa_overlay:
+                            ao_center_idx = np.minimum(
+                                (ao_centers_s * fs_proc_full).astype(int),
+                                len(sample_bad_mask_full_record) - 1,
+                            )
+                            rr_center_idx = np.minimum(
+                                (rr_centers_s * fs_proc_full).astype(int),
+                                len(sample_bad_mask_full_record) - 1,
+                            )
+                            good_mask = (~sample_bad_mask_full_record[ao_center_idx]) & (~sample_bad_mask_full_record[rr_center_idx])
+                            ao_intervals_matched = ao_intervals_matched[good_mask]
+                            rr_intervals_matched = rr_intervals_matched[good_mask]
+                            ao_centers_s = ao_centers_s[good_mask]
+                            rr_centers_s = rr_centers_s[good_mask]
+
+                        # Apply physiological HR limits (30 bpm - 140 bpm)
+                        min_interval_ms = (60.0 / 140.0) * 1000.0
+                        max_interval_ms = (60.0 / 30.0) * 1000.0
+                        phys_mask = (
+                            (ao_intervals_matched >= min_interval_ms)
+                            & (ao_intervals_matched <= max_interval_ms)
+                            & (rr_intervals_matched >= min_interval_ms)
+                            & (rr_intervals_matched <= max_interval_ms)
+                        )
+                        ao_intervals_matched = ao_intervals_matched[phys_mask]
+                        rr_intervals_matched = rr_intervals_matched[phys_mask]
+                        ao_centers_s = ao_centers_s[phys_mask]
+                        rr_centers_s = rr_centers_s[phys_mask]
+
                         # Apply paired outlier removal if enabled
                         if remove_outliers:
-                            original_count = len(all_ao_intervals)
-                            
-                            # Use IQR method on both interval sets to identify outliers
+                            original_count = len(ao_intervals_matched)
+
                             def get_outlier_mask(intervals):
                                 if len(intervals) < 4:
                                     return np.ones(len(intervals), dtype=bool)
@@ -1766,51 +1977,84 @@ else:
                                 lower_bound = q1 - 1.5 * iqr
                                 upper_bound = q3 + 1.5 * iqr
                                 return (intervals >= lower_bound) & (intervals <= upper_bound)
-                            
-                            # Get masks for both interval sets
-                            ao_mask = get_outlier_mask(all_ao_intervals)
-                            rr_mask = get_outlier_mask(all_rr_intervals)
-                            
-                            # Combined mask: keep only pairs where BOTH are inliers
+
+                            ao_mask = get_outlier_mask(ao_intervals_matched)
+                            rr_mask = get_outlier_mask(rr_intervals_matched)
                             combined_mask = ao_mask & rr_mask
-                            
-                            # Apply mask to all interval arrays
-                            all_ao_intervals = all_ao_intervals[combined_mask]
-                            all_rr_intervals = all_rr_intervals[combined_mask]
-                            all_ao_intervals_times = all_ao_intervals_times[combined_mask]
-                            all_rr_intervals_times = all_rr_intervals_times[combined_mask]
-                            
-                            pairs_removed = original_count - len(all_ao_intervals)
-                            
+                            ao_intervals_matched = ao_intervals_matched[combined_mask]
+                            rr_intervals_matched = rr_intervals_matched[combined_mask]
+                            ao_centers_s = ao_centers_s[combined_mask]
+                            rr_centers_s = rr_centers_s[combined_mask]
+
+                            pairs_removed = original_count - len(ao_intervals_matched)
                             st.info(f"🔧 Outlier removal: {pairs_removed} interval pairs removed (maintained equal counts)")
-                        
-                        # Use the (potentially filtered) intervals directly
-                        ao_intervals_matched = all_ao_intervals
-                        rr_intervals_matched = all_rr_intervals
-                        
-                        # Calculate statistics
-                        correlation = np.corrcoef(ao_intervals_matched, rr_intervals_matched)[0, 1]
-                        rmse = np.sqrt(np.mean((ao_intervals_matched - rr_intervals_matched)**2))
-                        mae = np.mean(np.abs(ao_intervals_matched - rr_intervals_matched))
-                        
-                        # Bland-Altman statistics
-                        mean_intervals = (ao_intervals_matched + rr_intervals_matched) / 2
-                        diff_intervals = ao_intervals_matched - rr_intervals_matched
-                        mean_diff = np.mean(diff_intervals)
-                        std_diff = np.std(diff_intervals)
-                        
-                        # Display metrics
-                        st.markdown("#### 📈 Interval Comparison Statistics")
-                        col1, col2, col3, col4 = st.columns(4)
-                        
-                        with col1:
-                            st.metric("Correlation (r)", f"{correlation:.3f}")
-                        with col2:
-                            st.metric("RMSE", f"{rmse:.1f} ms")
-                        with col3:
-                            st.metric("MAE", f"{mae:.1f} ms")
-                        with col4:
-                            st.metric("Bias", f"{mean_diff:.1f} ms")
+
+                        if len(ao_intervals_matched) == 0:
+                            st.warning("Not enough matched intervals after filtering.")
+                        else:
+                            # Calculate statistics
+                            correlation = np.corrcoef(ao_intervals_matched, rr_intervals_matched)[0, 1] if len(ao_intervals_matched) > 1 else np.nan
+                            rmse = np.sqrt(np.mean((ao_intervals_matched - rr_intervals_matched)**2))
+                            mae = np.mean(np.abs(ao_intervals_matched - rr_intervals_matched))
+
+                            # Bland-Altman statistics
+                            mean_intervals = (ao_intervals_matched + rr_intervals_matched) / 2
+                            diff_intervals = ao_intervals_matched - rr_intervals_matched
+                            mean_diff = np.mean(diff_intervals)
+                            std_diff = np.std(diff_intervals)
+                            paper_metrics = compute_paper_metrics(ao_intervals_matched, rr_intervals_matched)
+
+                            # Display metrics
+                            st.markdown("#### 📈 Interval Comparison Statistics")
+                            col1, col2, col3, col4 = st.columns(4)
+
+                            with col1:
+                                st.metric("Correlation (r)", f"{correlation:.3f}")
+                            with col2:
+                                st.metric("RMSE", f"{rmse:.1f} ms")
+                            with col3:
+                                st.metric("MAE", f"{mae:.1f} ms")
+                            with col4:
+                                st.metric("Bias", f"{mean_diff:.1f} ms")
+
+                            if paper_metrics:
+                                col5, col6, col7, col8, col9 = st.columns(5)
+                                with col5:
+                                    st.metric("Mean SCG HR (BPM)", f"{paper_metrics['mean_scg_hr']:.1f}")
+                                with col6:
+                                    st.metric("Mean ECG HR (BPM)", f"{paper_metrics['mean_ecg_hr']:.1f}")
+                                with col7:
+                                    st.metric("ARE", f"{paper_metrics['ARE']:.3f}")
+                                with col8:
+                                    st.metric("AAE (BPM)", f"{paper_metrics['AAE']:.2f}")
+                                with col9:
+                                    st.metric("AAEP (%)", f"{paper_metrics['AAEP']:.2f}")
+
+                            detection_metrics = None
+                            if (not is_unhealthy) and len(all_ao_peaks) > 0 and len(all_r_peaks) > 0:
+                                detection_metrics = compute_detection_metrics(
+                                    all_ao_peaks, all_r_peaks, fs_proc_full, tolerance_seconds=0.15
+                                )
+                                if detection_metrics:
+                                    col10, col11, col12, col13, col14, col15, col16 = st.columns(7)
+                                    with col10:
+                                        st.metric("TP", f"{detection_metrics['TP']}")
+                                    with col11:
+                                        st.metric("FP", f"{detection_metrics['FP']}")
+                                    with col12:
+                                        st.metric("FN", f"{detection_metrics['FN']}")
+                                    with col13:
+                                        st.metric("SE (%)", f"{detection_metrics['SE']:.1f}")
+                                    with col14:
+                                        st.metric("P (%)", f"{detection_metrics['P']:.1f}")
+                                    with col15:
+                                        st.metric("ACC (%)", f"{detection_metrics['ACC']:.1f}")
+                                    with col16:
+                                        st.metric("DER (%)", f"{detection_metrics['DER']:.1f}")
+                                    st.caption(
+                                        "AO detection metrics use ECG R-peaks as reference. "
+                                        "True AO metrics require AO-labeled annotations."
+                                    )
                         
                         # Time series plot with overlayed intervals
                         st.markdown("#### ⏱️ Signals and Interval Time Series Comparison")
@@ -1937,100 +2181,101 @@ else:
                         
                         st.plotly_chart(fig_intervals, use_container_width=True)
                         
-                        # Bland-Altman Plot
-                        st.markdown("#### 📊 Bland-Altman Plot")
-                        fig_ba_full = go.Figure()
-                        
-                        fig_ba_full.add_trace(go.Scatter(
-                            x=mean_intervals,
-                            y=diff_intervals,
-                            mode='markers',
-                            marker=dict(size=6, color='blue', opacity=0.5),
-                            name='Data points'
-                        ))
-                        
-                        # Mean difference line
-                        fig_ba_full.add_hline(
-                            y=mean_diff,
-                            line_dash="solid",
-                            line_color="red",
-                            line_width=2,
-                            annotation_text=f"Mean: {mean_diff:.1f} ms",
-                            annotation_position="right"
-                        )
-                        
-                        # Limits of agreement
-                        upper_loa_full = mean_diff + 1.96 * std_diff
-                        lower_loa_full = mean_diff - 1.96 * std_diff
-                        
-                        fig_ba_full.add_hline(
-                            y=upper_loa_full,
-                            line_dash="dash",
-                            line_color="gray",
-                            line_width=1.5,
-                            annotation_text=f"+1.96 SD: {upper_loa_full:.1f} ms",
-                            annotation_position="right"
-                        )
-                        
-                        fig_ba_full.add_hline(
-                            y=lower_loa_full,
-                            line_dash="dash",
-                            line_color="gray",
-                            line_width=1.5,
-                            annotation_text=f"-1.96 SD: {lower_loa_full:.1f} ms",
-                            annotation_position="right"
-                        )
-                        
-                        fig_ba_full.update_layout(
-                            title="Bland-Altman Plot: AO-AO vs R-R Intervals (Full Record)",
-                            xaxis_title="Mean of AO-AO and R-R Intervals (ms)",
-                            yaxis_title="Difference (AO-AO - R-R) (ms)",
-                            height=500,
-                            plot_bgcolor='white',
-                            hovermode='closest'
-                        )
-                        fig_ba_full.update_xaxes(showgrid=True, gridcolor='rgba(200, 200, 200, 0.3)')
-                        fig_ba_full.update_yaxes(showgrid=True, gridcolor='rgba(200, 200, 0.3)')
-                        
-                        st.plotly_chart(fig_ba_full, use_container_width=True)
-                        
-                        # Correlation scatter plot
-                        st.markdown("#### 🔗 Interval Correlation")
-                        fig_corr_full = go.Figure()
-                        
-                        fig_corr_full.add_trace(go.Scatter(
-                            x=rr_intervals_matched,
-                            y=ao_intervals_matched,
-                            mode='markers',
-                            marker=dict(size=6, color='purple', opacity=0.5),
-                            name='Intervals'
-                        ))
-                        
-                        # Identity line
-                        min_val_full = min(np.min(rr_intervals_matched), 
-                                          np.min(ao_intervals_matched))
-                        max_val_full = max(np.max(rr_intervals_matched), 
-                                          np.max(ao_intervals_matched))
-                        fig_corr_full.add_trace(go.Scatter(
-                            x=[min_val_full, max_val_full],
-                            y=[min_val_full, max_val_full],
-                            mode='lines',
-                            line=dict(color='red', dash='dash', width=2),
-                            name='Identity line'
-                        ))
-                        
-                        fig_corr_full.update_layout(
-                            title=f"AO-AO vs R-R Intervals - Full Record (r = {correlation:.3f})",
-                            xaxis_title="R-R Interval (ms)",
-                            yaxis_title="AO-AO Interval (ms)",
-                            height=500,
-                            plot_bgcolor='white',
-                            hovermode='closest'
-                        )
-                        fig_corr_full.update_xaxes(showgrid=True, gridcolor='rgba(200, 200, 200, 0.3)')
-                        fig_corr_full.update_yaxes(showgrid=True, gridcolor='rgba(200, 200, 200, 0.3)')
-                        
-                        st.plotly_chart(fig_corr_full, use_container_width=True)
+                        if len(ao_intervals_matched) > 0:
+                            # Bland-Altman Plot
+                            st.markdown("#### 📊 Bland-Altman Plot")
+                            fig_ba_full = go.Figure()
+                            
+                            fig_ba_full.add_trace(go.Scatter(
+                                x=mean_intervals,
+                                y=diff_intervals,
+                                mode='markers',
+                                marker=dict(size=6, color='blue', opacity=0.5),
+                                name='Data points'
+                            ))
+                            
+                            # Mean difference line
+                            fig_ba_full.add_hline(
+                                y=mean_diff,
+                                line_dash="solid",
+                                line_color="red",
+                                line_width=2,
+                                annotation_text=f"Mean: {mean_diff:.1f} ms",
+                                annotation_position="right"
+                            )
+                            
+                            # Limits of agreement
+                            upper_loa_full = mean_diff + 1.96 * std_diff
+                            lower_loa_full = mean_diff - 1.96 * std_diff
+                            
+                            fig_ba_full.add_hline(
+                                y=upper_loa_full,
+                                line_dash="dash",
+                                line_color="gray",
+                                line_width=1.5,
+                                annotation_text=f"+1.96 SD: {upper_loa_full:.1f} ms",
+                                annotation_position="right"
+                            )
+                            
+                            fig_ba_full.add_hline(
+                                y=lower_loa_full,
+                                line_dash="dash",
+                                line_color="gray",
+                                line_width=1.5,
+                                annotation_text=f"-1.96 SD: {lower_loa_full:.1f} ms",
+                                annotation_position="right"
+                            )
+                            
+                            fig_ba_full.update_layout(
+                                title="Bland-Altman Plot: AO-AO vs R-R Intervals (Full Record)",
+                                xaxis_title="Mean of AO-AO and R-R Intervals (ms)",
+                                yaxis_title="Difference (AO-AO - R-R) (ms)",
+                                height=500,
+                                plot_bgcolor='white',
+                                hovermode='closest'
+                            )
+                            fig_ba_full.update_xaxes(showgrid=True, gridcolor='rgba(200, 200, 200, 0.3)')
+                            fig_ba_full.update_yaxes(showgrid=True, gridcolor='rgba(200, 200, 0.3)')
+                            
+                            st.plotly_chart(fig_ba_full, use_container_width=True)
+                            
+                            # Correlation scatter plot
+                            st.markdown("#### 🔗 Interval Correlation")
+                            fig_corr_full = go.Figure()
+                            
+                            fig_corr_full.add_trace(go.Scatter(
+                                x=rr_intervals_matched,
+                                y=ao_intervals_matched,
+                                mode='markers',
+                                marker=dict(size=6, color='purple', opacity=0.5),
+                                name='Intervals'
+                            ))
+                            
+                            # Identity line
+                            min_val_full = min(np.min(rr_intervals_matched), 
+                                              np.min(ao_intervals_matched))
+                            max_val_full = max(np.max(rr_intervals_matched), 
+                                              np.max(ao_intervals_matched))
+                            fig_corr_full.add_trace(go.Scatter(
+                                x=[min_val_full, max_val_full],
+                                y=[min_val_full, max_val_full],
+                                mode='lines',
+                                line=dict(color='red', dash='dash', width=2),
+                                name='Identity line'
+                            ))
+                            
+                            fig_corr_full.update_layout(
+                                title=f"AO-AO vs R-R Intervals - Full Record (r = {correlation:.3f})",
+                                xaxis_title="R-R Interval (ms)",
+                                yaxis_title="AO-AO Interval (ms)",
+                                height=500,
+                                plot_bgcolor='white',
+                                hovermode='closest'
+                            )
+                            fig_corr_full.update_xaxes(showgrid=True, gridcolor='rgba(200, 200, 200, 0.3)')
+                            fig_corr_full.update_yaxes(showgrid=True, gridcolor='rgba(200, 200, 200, 0.3)')
+                            
+                            st.plotly_chart(fig_corr_full, use_container_width=True)
                         
                     else:
                         st.warning("Not enough peaks detected for interval comparison.")
@@ -2170,7 +2415,7 @@ else:
                             progress_bar.progress(int((idx / len(records)) * 100))
 
                             try:
-                                signals_batch, _, fs_batch = load_unhealthy_patient_data(record_name, base_dir)
+                                signals_batch, r_peaks_indices, r_peaks_seconds, fs_batch = load_unhealthy_patient_data(record_name, base_dir)
                                 total_duration_batch = len(signals_batch) / fs_batch
                                 label_str = get_unhealthy_label_str(labels_df, record_name)
 
@@ -2216,6 +2461,10 @@ else:
                                         "Correlation": "N/A",
                                         "RMSE (ms)": "N/A",
                                         "MAE (ms)": "N/A",
+                                        "ARE": "N/A",
+                                        "AAEP (%)": "N/A",
+                                        "Mean SCG HR": "N/A",
+                                        "Mean ECG HR": "N/A",
                                         "Status": "⚠ Skipped (duration too short)"
                                     })
                                     continue
@@ -2327,11 +2576,42 @@ else:
                                 if show_sqa_overlay and skipped_bad_windows_local > 0:
                                     st.info(f"{skipped_bad_windows_local} windows skipped for {record_name} due to SQA")
 
-                                if remove_outliers:
-                                    min_len = min(len(all_ao_intervals_batch), len(all_rr_intervals_batch))
-                                    all_ao_intervals_batch = all_ao_intervals_batch[:min_len]
-                                    all_rr_intervals_batch = all_rr_intervals_batch[:min_len]
+                                r_peaks_ref = (r_peaks_seconds * fs_proc_batch).astype(int)
+                                all_r_peaks_batch = r_peaks_ref
 
+                                ao_intervals_matched, rr_intervals_matched, ao_centers_s, rr_centers_s = match_intervals_by_time(
+                                    all_ao_peaks_batch, r_peaks_ref, fs_proc_batch
+                                )
+
+                                # Filter matched intervals from bad SQA segments
+                                if sample_bad_mask_record is not None and show_sqa_overlay:
+                                    ao_center_idx = np.minimum(
+                                        (ao_centers_s * fs_proc_batch).astype(int),
+                                        len(sample_bad_mask_record) - 1,
+                                    )
+                                    rr_center_idx = np.minimum(
+                                        (rr_centers_s * fs_proc_batch).astype(int),
+                                        len(sample_bad_mask_record) - 1,
+                                    )
+                                    good_mask = (~sample_bad_mask_record[ao_center_idx]) & (~sample_bad_mask_record[rr_center_idx])
+                                    ao_intervals_matched = ao_intervals_matched[good_mask]
+                                    rr_intervals_matched = rr_intervals_matched[good_mask]
+                                    ao_centers_s = ao_centers_s[good_mask]
+                                    rr_centers_s = rr_centers_s[good_mask]
+
+                                # Apply physiological HR limits (30-140 bpm)
+                                min_interval_ms = (60.0 / 140.0) * 1000.0
+                                max_interval_ms = (60.0 / 30.0) * 1000.0
+                                phys_mask = (
+                                    (ao_intervals_matched >= min_interval_ms)
+                                    & (ao_intervals_matched <= max_interval_ms)
+                                    & (rr_intervals_matched >= min_interval_ms)
+                                    & (rr_intervals_matched <= max_interval_ms)
+                                )
+                                ao_intervals_matched = ao_intervals_matched[phys_mask]
+                                rr_intervals_matched = rr_intervals_matched[phys_mask]
+
+                                if remove_outliers:
                                     def get_outlier_mask(intervals):
                                         if len(intervals) < 4:
                                             return np.ones(len(intervals), dtype=bool)
@@ -2342,21 +2622,18 @@ else:
                                         upper_bound = q3 + 1.5 * iqr
                                         return (intervals >= lower_bound) & (intervals <= upper_bound)
 
-                                    ao_mask = get_outlier_mask(all_ao_intervals_batch)
-                                    rr_mask = get_outlier_mask(all_rr_intervals_batch)
+                                    ao_mask = get_outlier_mask(ao_intervals_matched)
+                                    rr_mask = get_outlier_mask(rr_intervals_matched)
                                     combined_mask = ao_mask & rr_mask
 
-                                    all_ao_intervals_batch = all_ao_intervals_batch[combined_mask]
-                                    all_rr_intervals_batch = all_rr_intervals_batch[combined_mask]
+                                    ao_intervals_matched = ao_intervals_matched[combined_mask]
+                                    rr_intervals_matched = rr_intervals_matched[combined_mask]
 
-                                min_len = min(len(all_ao_intervals_batch), len(all_rr_intervals_batch))
-                                if min_len > 1:
-                                    ao_intervals_matched = all_ao_intervals_batch[:min_len]
-                                    rr_intervals_matched = all_rr_intervals_batch[:min_len]
-
+                                if len(ao_intervals_matched) > 1:
                                     correlation = np.corrcoef(ao_intervals_matched, rr_intervals_matched)[0, 1]
                                     rmse = np.sqrt(np.mean((ao_intervals_matched - rr_intervals_matched)**2))
                                     mae = np.mean(np.abs(ao_intervals_matched - rr_intervals_matched))
+                                    paper_metrics = compute_paper_metrics(ao_intervals_matched, rr_intervals_matched)
 
                                     if save_json_output and len(all_ao_peaks_batch) > 0:
                                         save_peaks_to_json(np.array(all_ao_peaks_batch), fs_proc_batch, record_name, output_folder)
@@ -2371,6 +2648,10 @@ else:
                                         "Correlation": f"{correlation:.3f}",
                                         "RMSE (ms)": f"{rmse:.1f}",
                                         "MAE (ms)": f"{mae:.1f}",
+                                        "ARE": f"{paper_metrics['ARE']:.3f}" if paper_metrics else "N/A",
+                                        "AAEP (%)": f"{paper_metrics['AAEP']:.2f}" if paper_metrics else "N/A",
+                                        "Mean SCG HR": f"{paper_metrics['mean_scg_hr']:.1f}" if paper_metrics else "N/A",
+                                        "Mean ECG HR": f"{paper_metrics['mean_ecg_hr']:.1f}" if paper_metrics else "N/A",
                                         "Status": "✓ OK"
                                     })
                                 else:
@@ -2384,6 +2665,10 @@ else:
                                         "Correlation": "N/A",
                                         "RMSE (ms)": "N/A",
                                         "MAE (ms)": "N/A",
+                                        "ARE": "N/A",
+                                        "AAEP (%)": "N/A",
+                                        "Mean SCG HR": "N/A",
+                                        "Mean ECG HR": "N/A",
                                         "Status": "⚠ Insufficient intervals"
                                     })
 
@@ -2398,6 +2683,10 @@ else:
                                     "Correlation": "N/A",
                                     "RMSE (ms)": "N/A",
                                     "MAE (ms)": "N/A",
+                                    "ARE": "N/A",
+                                    "AAEP (%)": "N/A",
+                                    "Mean SCG HR": "N/A",
+                                    "Mean ECG HR": "N/A",
                                     "Status": "❌ Error",
                                     "Error": str(e)
                                 })
@@ -2415,6 +2704,13 @@ else:
 
                                 record_data = wfdb.rdsamp(os.path.join(db_path, record_name))
                                 signals_batch = record_data[0]
+
+                                anns_batch = None
+                                try:
+                                    ann = wfdb.rdann(os.path.join(db_path, record_name), "atr")
+                                    anns_batch = ann.sample
+                                except:
+                                    anns_batch = None
 
                                 scg_proc_batch, fs_proc_batch = resample_for_processing(signals_batch[:, 3], fs_batch, target_fs=500)
                                 ecg_proc_batch, _ = resample_for_processing(signals_batch[:, 0], fs_batch, target_fs=500)
@@ -2562,12 +2858,38 @@ else:
                                 if show_sqa_overlay and skipped_bad_windows_local > 0:
                                     st.info(f"{skipped_bad_windows_local} windows skipped for {record_name} due to SQA")
 
+                                ao_intervals_matched, rr_intervals_matched, ao_centers_s, rr_centers_s = match_intervals_by_time(
+                                    all_ao_peaks_batch, all_r_peaks_batch, fs_proc_batch
+                                )
+
+                                # Filter matched intervals from bad SQA segments
+                                if sample_bad_mask_record is not None and show_sqa_overlay:
+                                    ao_center_idx = np.minimum(
+                                        (ao_centers_s * fs_proc_batch).astype(int),
+                                        len(sample_bad_mask_record) - 1,
+                                    )
+                                    rr_center_idx = np.minimum(
+                                        (rr_centers_s * fs_proc_batch).astype(int),
+                                        len(sample_bad_mask_record) - 1,
+                                    )
+                                    good_mask = (~sample_bad_mask_record[ao_center_idx]) & (~sample_bad_mask_record[rr_center_idx])
+                                    ao_intervals_matched = ao_intervals_matched[good_mask]
+                                    rr_intervals_matched = rr_intervals_matched[good_mask]
+
+                                # Apply physiological HR limits (30-140 bpm)
+                                min_interval_ms = (60.0 / 140.0) * 1000.0
+                                max_interval_ms = (60.0 / 30.0) * 1000.0
+                                phys_mask = (
+                                    (ao_intervals_matched >= min_interval_ms)
+                                    & (ao_intervals_matched <= max_interval_ms)
+                                    & (rr_intervals_matched >= min_interval_ms)
+                                    & (rr_intervals_matched <= max_interval_ms)
+                                )
+                                ao_intervals_matched = ao_intervals_matched[phys_mask]
+                                rr_intervals_matched = rr_intervals_matched[phys_mask]
+
                                 # Apply paired outlier removal if enabled
                                 if remove_outliers:
-                                    min_len = min(len(all_ao_intervals_batch), len(all_rr_intervals_batch))
-                                    all_ao_intervals_batch = all_ao_intervals_batch[:min_len]
-                                    all_rr_intervals_batch = all_rr_intervals_batch[:min_len]
-
                                     def get_outlier_mask(intervals):
                                         if len(intervals) < 4:
                                             return np.ones(len(intervals), dtype=bool)
@@ -2578,23 +2900,25 @@ else:
                                         upper_bound = q3 + 1.5 * iqr
                                         return (intervals >= lower_bound) & (intervals <= upper_bound)
 
-                                    ao_mask = get_outlier_mask(all_ao_intervals_batch)
-                                    rr_mask = get_outlier_mask(all_rr_intervals_batch)
+                                    ao_mask = get_outlier_mask(ao_intervals_matched)
+                                    rr_mask = get_outlier_mask(rr_intervals_matched)
                                     combined_mask = ao_mask & rr_mask
 
-                                    all_ao_intervals_batch = all_ao_intervals_batch[combined_mask]
-                                    all_rr_intervals_batch = all_rr_intervals_batch[combined_mask]
+                                    ao_intervals_matched = ao_intervals_matched[combined_mask]
+                                    rr_intervals_matched = rr_intervals_matched[combined_mask]
 
-                                # Match lengths
-                                min_len = min(len(all_ao_intervals_batch), len(all_rr_intervals_batch))
-                                if min_len > 1:
-                                    ao_intervals_matched = all_ao_intervals_batch[:min_len]
-                                    rr_intervals_matched = all_rr_intervals_batch[:min_len]
-
+                                if len(ao_intervals_matched) > 1:
                                     # Compute statistics
                                     correlation = np.corrcoef(ao_intervals_matched, rr_intervals_matched)[0, 1]
                                     rmse = np.sqrt(np.mean((ao_intervals_matched - rr_intervals_matched)**2))
                                     mae = np.mean(np.abs(ao_intervals_matched - rr_intervals_matched))
+                                    paper_metrics = compute_paper_metrics(ao_intervals_matched, rr_intervals_matched)
+
+                                    detection_metrics = None
+                                    if len(all_ao_peaks_batch) > 0 and len(all_r_peaks_batch) > 0:
+                                        detection_metrics = compute_detection_metrics(
+                                            all_ao_peaks_batch, all_r_peaks_batch, fs_proc_batch, tolerance_seconds=0.15
+                                        )
 
                                     if save_json_output and len(all_ao_peaks_batch) > 0:
                                         save_peaks_to_json(np.array(all_ao_peaks_batch), fs_proc_batch, record_name, output_folder)
@@ -2608,6 +2932,13 @@ else:
                                         "Correlation": f"{correlation:.3f}",
                                         "RMSE (ms)": f"{rmse:.1f}",
                                         "MAE (ms)": f"{mae:.1f}",
+                                        "ARE": f"{paper_metrics['ARE']:.3f}" if paper_metrics else "N/A",
+                                        "AAEP (%)": f"{paper_metrics['AAEP']:.2f}" if paper_metrics else "N/A",
+                                        "Mean SCG HR": f"{paper_metrics['mean_scg_hr']:.1f}" if paper_metrics else "N/A",
+                                        "Mean ECG HR": f"{paper_metrics['mean_ecg_hr']:.1f}" if paper_metrics else "N/A",
+                                        "SE (%)": f"{detection_metrics['SE']:.1f}" if detection_metrics else "N/A",
+                                        "P (%)": f"{detection_metrics['P']:.1f}" if detection_metrics else "N/A",
+                                        "ACC (%)": f"{detection_metrics['ACC']:.1f}" if detection_metrics else "N/A",
                                         "Status": "✓ OK"
                                     })
                                 else:
@@ -2620,6 +2951,13 @@ else:
                                         "Correlation": "N/A",
                                         "RMSE (ms)": "N/A",
                                         "MAE (ms)": "N/A",
+                                        "ARE": "N/A",
+                                        "AAEP (%)": "N/A",
+                                        "Mean SCG HR": "N/A",
+                                        "Mean ECG HR": "N/A",
+                                        "SE (%)": "N/A",
+                                        "P (%)": "N/A",
+                                        "ACC (%)": "N/A",
                                         "Status": "⚠ Insufficient intervals"
                                     })
 
@@ -2633,6 +2971,13 @@ else:
                                     "Correlation": "N/A",
                                     "RMSE (ms)": "N/A",
                                     "MAE (ms)": "N/A",
+                                    "ARE": "N/A",
+                                    "AAEP (%)": "N/A",
+                                    "Mean SCG HR": "N/A",
+                                    "Mean ECG HR": "N/A",
+                                    "SE (%)": "N/A",
+                                    "P (%)": "N/A",
+                                    "ACC (%)": "N/A",
                                     "Status": "❌ Error",
                                     "Error": str(e)
                                 })
