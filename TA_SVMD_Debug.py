@@ -10,7 +10,9 @@ import pandas as pd
 from scipy import signal
 from scipy.signal import find_peaks
 from scipy.signal import savgol_filter
+from scipy.signal import hilbert
 from scipy.stats import zscore
+from scipy.stats import kurtosis
 
 
 def format_timestamp(seconds_val):
@@ -445,13 +447,40 @@ def apply_mti_filter(raw_signal):
     
     return y_smoothed
 
-def autocorr_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, max_hr_bpm=180,
-                 min_peak_prominence=0.03, autocorr_threshold=0.25):
-    """
-    Autocorrelation-only periodicity SQA.
-    
-    Flags segments with weak periodic peaks in the physiological HR range.
-    """
+def sqa_kurtosis(segment, threshold=7.0):
+    return kurtosis(segment) > threshold
+
+
+def sqa_zcr(segment, fs, low_hz=0.5, high_hz=5.0):
+    zcr = np.sum(np.diff(np.sign(segment)) != 0) / (len(segment) / fs)
+    return zcr < low_hz or zcr > high_hz
+
+
+def sqa_flatline(segment, cv_thresh=0.01, diff_thresh=1e-4):
+    cv = np.std(segment) / (np.abs(np.mean(segment)) + 1e-9)
+    return cv < cv_thresh or np.max(np.abs(np.diff(segment))) < diff_thresh
+
+
+def sqa_envelope(segment, threshold=2.5):
+    env = np.abs(hilbert(segment))
+    return (np.std(env) / (np.mean(env) + 1e-9)) > threshold
+
+
+def sqa_combined(segment, fs, min_flags=2,
+                 kurt_thresh=7.0, zcr_low=0.5, zcr_high=5.0,
+                 cv_thresh=0.01, diff_thresh=1e-4, env_thresh=2.5):
+    flags = [
+        sqa_kurtosis(segment, kurt_thresh),
+        sqa_zcr(segment, fs, zcr_low, zcr_high),
+        sqa_flatline(segment, cv_thresh, diff_thresh),
+        sqa_envelope(segment, env_thresh),
+    ]
+    return sum(flags) >= min_flags, flags
+
+
+def combined_sqa_for_signal(signal_in, fs, segment_seconds=4.0, min_flags=2,
+                            kurt_thresh=7.0, zcr_low=0.5, zcr_high=5.0,
+                            cv_thresh=0.01, diff_thresh=1e-4, env_thresh=2.5):
     x = np.asarray(signal_in, dtype=float).flatten()
     n = len(x)
     if n == 0 or fs <= 0:
@@ -459,147 +488,42 @@ def autocorr_sqa(signal_in, fs, segment_seconds=4.0, min_hr_bpm=40, max_hr_bpm=1
             "segment_starts": np.array([]),
             "segment_ends": np.array([]),
             "bad_mask": np.array([], dtype=bool),
-            "method": "autocorr",
+            "flags": np.empty((0, 4), dtype=bool),
+            "method": "combined",
         }
 
     seg_len = max(1, int(segment_seconds * fs))
     seg_starts = np.arange(0, n, seg_len)
     seg_ends = np.minimum(seg_starts + seg_len, n)
 
-    lag_min = int(fs * (60.0 / max_hr_bpm))
-    lag_max = int(fs * (60.0 / min_hr_bpm))
-    lag_min = max(1, lag_min)
-
-    peak_ratios = []
-    seg_rms = []
-    for s, e in zip(seg_starts, seg_ends):
-        seg = x[s:e]
-        if len(seg) < max(16, lag_max + 2):
-            peak_ratios.append(np.nan)
-            seg_rms.append(np.nan)
-            continue
-
-        seg_det = signal.detrend(seg)
-        seg_rms.append(float(np.sqrt(np.mean(seg_det**2))))
-        
-        seg_std = np.std(seg_det)
-        if seg_std < 1e-10:
-            peak_ratios.append(0.0)
-            continue
-        seg_norm = (seg_det - np.mean(seg_det)) / seg_std
-
-        ac = np.correlate(seg_norm, seg_norm, mode="full")
-        ac = ac[len(seg_norm)-1:]
-        if ac[0] <= 1e-10:
-            peak_ratios.append(0.0)
-            continue
-        ac_norm = ac / ac[0]
-
-        lag_hi = min(lag_max, len(ac_norm) - 1)
-        if lag_min >= lag_hi:
-            peak_ratios.append(np.nan)
-            continue
-
-        ac_search = ac_norm[lag_min:lag_hi + 1]
-        peaks, props = find_peaks(
-            ac_search,
-            prominence=min_peak_prominence,
-            distance=max(1, int(0.25 * fs)),
-        )
-
-        if len(peaks) == 0:
-            peak_ratios.append(0.0)
-        else:
-            heights = ac_search[peaks]
-            peak_ratios.append(float(np.max(heights)))
-
-    peak_ratios = np.asarray(peak_ratios, dtype=float)
-    seg_rms = np.asarray(seg_rms, dtype=float)
-    
-    bad_mask = np.isnan(peak_ratios) | (peak_ratios < autocorr_threshold)
-
-    # Bridge isolated good segments
-    if len(bad_mask) >= 3:
-        for idx in range(1, len(bad_mask) - 1):
-            if (not bad_mask[idx]) and bad_mask[idx - 1] and bad_mask[idx + 1]:
-                bad_mask[idx] = True
-
-    return {
-        "segment_starts": seg_starts,
-        "segment_ends": seg_ends,
-        "bad_mask": bad_mask,
-        "peak_ratios": peak_ratios,
-        "seg_rms": seg_rms,
-        "method": "autocorr",
-    }
-
-def rms_sqa(signal_in, fs, segment_seconds=4.0, rms_low_percentile=20, rms_high_percentile=80,
-            rms_low_mad_mult=2.0, rms_high_mad_mult=4.0):
-    """
-    RMS-only SQA: detects both low RMS (dead/flat channels) and high RMS (bursts/noise).
-    
-    Parameters:
-      rms_low_percentile: Percentile for low RMS threshold (lower = stricter).
-      rms_high_percentile: Percentile for high RMS threshold (higher = more tolerant).
-      rms_low_mad_mult: MAD multiplier for low bound (higher = more tolerant).
-      rms_high_mad_mult: MAD multiplier for high bound (lower = stricter).
-    """
-    x = np.asarray(signal_in, dtype=float).flatten()
-    n = len(x)
-    if n == 0 or fs <= 0:
-        return {
-            "segment_starts": np.array([]),
-            "segment_ends": np.array([]),
-            "bad_mask": np.array([], dtype=bool),
-            "method": "rms",
-        }
-
-    seg_len = max(1, int(segment_seconds * fs))
-    seg_starts = np.arange(0, n, seg_len)
-    seg_ends = np.minimum(seg_starts + seg_len, n)
-
-    seg_rms = []
+    bad_mask = []
+    flags_all = []
     for s, e in zip(seg_starts, seg_ends):
         seg = x[s:e]
         if len(seg) < 16:
-            seg_rms.append(np.nan)
+            bad_mask.append(True)
+            flags_all.append([True, True, True, True])
             continue
-        seg_det = signal.detrend(seg)
-        seg_rms.append(float(np.sqrt(np.mean(seg_det**2))))
-
-    seg_rms = np.asarray(seg_rms, dtype=float)
-
-    valid_rms = seg_rms[np.isfinite(seg_rms)]
-    if len(valid_rms) > 0:
-        rms_low_perc = float(np.percentile(valid_rms, rms_low_percentile))
-        rms_high_perc = float(np.percentile(valid_rms, rms_high_percentile))
-        rms_med = float(np.median(valid_rms))
-        rms_mad = float(np.median(np.abs(valid_rms - rms_med)))
-        
-        rms_low_thr = max(rms_low_perc, rms_med - rms_low_mad_mult * rms_mad) if rms_mad > 1e-12 else rms_low_perc
-        rms_high_thr = max(rms_high_perc, rms_med + rms_high_mad_mult * rms_mad) if rms_mad > 1e-12 else rms_high_perc * 3.0
-    else:
-        rms_low_thr = 1e-10
-        rms_high_thr = float('inf')
-    
-    bad_mask = (seg_rms < rms_low_thr) | (seg_rms > rms_high_thr) | np.isnan(seg_rms)
-
-    # Bridge isolated good segments
-    if len(bad_mask) >= 3:
-        for idx in range(1, len(bad_mask) - 1):
-            if (not bad_mask[idx]) and bad_mask[idx - 1] and bad_mask[idx + 1]:
-                bad_mask[idx] = True
+        is_bad, flags = sqa_combined(
+            seg,
+            fs,
+            min_flags=min_flags,
+            kurt_thresh=kurt_thresh,
+            zcr_low=zcr_low,
+            zcr_high=zcr_high,
+            cv_thresh=cv_thresh,
+            diff_thresh=diff_thresh,
+            env_thresh=env_thresh,
+        )
+        bad_mask.append(is_bad)
+        flags_all.append(flags)
 
     return {
         "segment_starts": seg_starts,
         "segment_ends": seg_ends,
-        "bad_mask": bad_mask,
-        "seg_rms": seg_rms,
-        "rms_bounds": {
-            "low": float(rms_low_thr),
-            "high": float(rms_high_thr),
-        },
-        "method": "rms",
+        "bad_mask": np.asarray(bad_mask, dtype=bool),
+        "flags": np.asarray(flags_all, dtype=bool),
+        "method": "combined",
     }
 
 def build_sample_bad_mask(signal_len, sqa_result):
@@ -972,13 +896,6 @@ else:
             help="Applies only to Full Record Analysis. Bad segments are shown in red.",
         )
         
-        sqa_method = st.radio(
-            "SQA Method",
-            ["Autocorrelation (Periodicity)", "RMS (Low/High Bounds)"],
-            horizontal=True,
-            help="Autocorrelation: detects non-periodic noise. RMS: detects dead channels and bursts.",
-        )
-        
         sqa_segment_seconds = st.slider(
             "SQA Segment Length (s)",
             min_value=3,
@@ -987,83 +904,66 @@ else:
             step=1,
         )
         
-        # Autocorrelation-specific parameters
-        if sqa_method == "Autocorrelation (Periodicity)":
-            st.caption("Autocorrelation Parameters:")
-            autocorr_threshold = st.slider(
-                "Autocorr peak ratio threshold",
-                min_value=0.05,
-                max_value=0.80,
-                value=0.25,
-                step=0.01,
-                key="autocorr_threshold",
-                help="Lower = stricter (more segments flagged). Peak ratio = autocorr peak / zero-lag.",
+        min_flags_to_reject = st.slider(
+            "Minimum detectors to flag a window as bad",
+            min_value=1,
+            max_value=4,
+            value=2,
+            step=1,
+            key="min_flags",
+            help=(
+                "1 = very sensitive (any detector flags = bad). "
+                "4 = only flag if ALL detectors agree."
+            ),
+        )
+
+        with st.expander("Advanced detector thresholds"):
+            kurt_thresh = st.slider(
+                "Kurtosis threshold",
+                3.0,
+                20.0,
+                7.0,
+                0.5,
+                key="kurt_thresh",
+                help="Higher = only flag extreme spike bursts.",
             )
-            autocorr_prominence = st.slider(
-                "Autocorr peak prominence",
-                min_value=0.01,
-                max_value=0.10,
-                value=0.03,
-                step=0.01,
-                key="autocorr_prominence",
-                help="Higher = requires more distinct peaks.",
+            zcr_low = st.slider(
+                "ZCR low bound (Hz)",
+                0.1,
+                2.0,
+                0.5,
+                0.1,
+                key="zcr_low",
+                help="Flatline/dead channels fall below this.",
             )
-        else:
-            autocorr_threshold = 0.25
-            autocorr_prominence = 0.03
-        
-        # RMS-specific parameters
-        if sqa_method == "RMS (Low/High Bounds)":
-            st.caption("RMS Parameters:")
-            col1, col2 = st.columns(2)
-            with col1:
-                rms_low_percentile = st.slider(
-                    "RMS low percentile",
-                    min_value=5,
-                    max_value=30,
-                    value=20,
-                    step=1,
-                    key="rms_low_perc",
-                    help="Lower = stricter on dead channels.",
-                )
-                rms_low_mad_mult = st.slider(
-                    "RMS low MAD multiplier",
-                    min_value=0.5,
-                    max_value=4.0,
-                    value=2.0,
-                    step=0.25,
-                    key="rms_low_mad",
-                    help="Higher = more tolerant of low RMS.",
-                )
-            with col2:
-                rms_high_percentile = st.slider(
-                    "RMS high percentile",
-                    min_value=70,
-                    max_value=95,
-                    value=80,
-                    step=1,
-                    key="rms_high_perc",
-                    help="Higher = more tolerant of bursts.",
-                )
-                rms_high_mad_mult = st.slider(
-                    "RMS high MAD multiplier",
-                    min_value=2.0,
-                    max_value=8.0,
-                    value=4.0,
-                    step=0.25,
-                    key="rms_high_mad",
-                    help="Lower = stricter on bursts.",
-                )
-        else:
-            rms_low_percentile = 20
-            rms_high_percentile = 80
-            rms_low_mad_mult = 2.0
-            rms_high_mad_mult = 4.0
+            zcr_high = st.slider(
+                "ZCR high bound (Hz)",
+                2.0,
+                20.0,
+                5.0,
+                0.5,
+                key="zcr_high",
+                help="High-frequency noise exceeds this.",
+            )
+            env_thresh = st.slider(
+                "Envelope CV threshold",
+                1.0,
+                5.0,
+                2.5,
+                0.1,
+                key="env_thresh",
+                help="Catches non-stationary amplitude bursts.",
+            )
         
         exclude_bad_windows = st.checkbox(
             "Skip very noisy windows in Full Record Analysis",
             value=True,
             help="Skips 10s windows where too much of the segment is flagged bad by SQA.",
+        )
+        show_sqa_breakdown = st.checkbox(
+            "Show SQA breakdown",
+            value=False,
+            help="Displays per-window detector flags for debugging.",
         )
         bad_window_fraction_threshold = st.slider(
             "Skip window if bad fraction >=",
@@ -1729,51 +1629,37 @@ else:
                 sample_bad_mask_full_record = None
                 if show_sqa_overlay:
                     # Per-record SQA to avoid cross-record/global bias.
-                    if sqa_method == "Autocorrelation (Periodicity)":
-                        sqa_result_full_record = autocorr_sqa(
-                            scg_proc_full,
-                            fs=fs_proc_full,
-                            segment_seconds=float(sqa_segment_seconds),
-                            min_peak_prominence=float(autocorr_prominence),
-                            autocorr_threshold=float(autocorr_threshold),
-                        )
-                    else:  # RMS method
-                        sqa_result_full_record = rms_sqa(
-                            scg_proc_full,
-                            fs=fs_proc_full,
-                            segment_seconds=float(sqa_segment_seconds),
-                            rms_low_percentile=int(rms_low_percentile),
-                            rms_high_percentile=int(rms_high_percentile),
-                            rms_low_mad_mult=float(rms_low_mad_mult),
-                            rms_high_mad_mult=float(rms_high_mad_mult),
-                        )
-                    
+                    sqa_result_full_record = combined_sqa_for_signal(
+                        scg_proc_full,
+                        fs=fs_proc_full,
+                        segment_seconds=float(sqa_segment_seconds),
+                        min_flags=int(min_flags_to_reject),
+                        kurt_thresh=float(kurt_thresh),
+                        zcr_low=float(zcr_low),
+                        zcr_high=float(zcr_high),
+                        env_thresh=float(env_thresh),
+                    )
+
                     sample_bad_mask_full_record = build_sample_bad_mask(
                         len(scg_proc_full),
                         sqa_result_full_record,
                     )
 
                     bad_pct_full = float(np.mean(sample_bad_mask_full_record) * 100.0)
-                    
-                    if sqa_method == "Autocorrelation (Periodicity)":
-                        peak_ratios = sqa_result_full_record.get("peak_ratios", np.array([]))
-                        valid_peaks = peak_ratios[np.isfinite(peak_ratios)]
-                        if len(valid_peaks) > 0:
-                            st.caption(
-                                f"Autocorr Method | Threshold: {autocorr_threshold:.3f} | "
-                                f"Median peak ratio: {np.median(valid_peaks):.3f} | "
-                                f"Bad samples: {bad_pct_full:.1f}%"
+
+                    st.caption(
+                        f"Combined SQA | Min flags: {min_flags_to_reject} | "
+                        f"Bad samples: {bad_pct_full:.1f}%"
+                    )
+
+                    if show_sqa_breakdown:
+                        flag_rows = sqa_result_full_record.get("flags", np.empty((0, 4), dtype=bool))
+                        if len(flag_rows) > 0:
+                            sqa_breakdown_df = pd.DataFrame(
+                                flag_rows,
+                                columns=["Kurtosis", "ZCR", "Flatline", "Envelope"],
                             )
-                    else:
-                        seg_rms = sqa_result_full_record.get("seg_rms", np.array([]))
-                        seg_rms_valid = seg_rms[np.isfinite(seg_rms)]
-                        if len(seg_rms_valid) > 0:
-                            rms_bounds = sqa_result_full_record.get("rms_bounds", {})
-                            st.caption(
-                                f"RMS Method | Bounds: [{rms_bounds['low']:.4f}, {rms_bounds['high']:.4f}] | "
-                                f"Median RMS: {np.median(seg_rms_valid):.4f} | "
-                                f"Bad samples: {bad_pct_full:.1f}%"
-                            )
+                            st.dataframe(sqa_breakdown_df, use_container_width=True, hide_index=True)
                 
                 window_duration = 10.0  # 10 second windows
                 num_windows = int((len(scg_proc_full) / fs_proc_full) / window_duration)
@@ -2428,26 +2314,21 @@ else:
                                 sqa_result_record = None
                                 sample_bad_mask_record = None
                                 if show_sqa_overlay:
-                                    if sqa_method == "Autocorrelation (Periodicity)":
-                                        sqa_result_record = autocorr_sqa(
-                                            scg_proc_batch,
-                                            fs=fs_proc_batch,
-                                            segment_seconds=float(sqa_segment_seconds),
-                                            min_peak_prominence=float(autocorr_prominence),
-                                            autocorr_threshold=float(autocorr_threshold),
-                                        )
-                                    else:
-                                        sqa_result_record = rms_sqa(
-                                            scg_proc_batch,
-                                            fs=fs_proc_batch,
-                                            segment_seconds=float(sqa_segment_seconds),
-                                            rms_low_percentile=int(rms_low_percentile),
-                                            rms_high_percentile=int(rms_high_percentile),
-                                            rms_low_mad_mult=float(rms_low_mad_mult),
-                                            rms_high_mad_mult=float(rms_high_mad_mult),
-                                        )
+                                    sqa_result_record = combined_sqa_for_signal(
+                                        scg_proc_batch,
+                                        fs=fs_proc_batch,
+                                        segment_seconds=float(sqa_segment_seconds),
+                                        min_flags=int(min_flags_to_reject),
+                                        kurt_thresh=float(kurt_thresh),
+                                        zcr_low=float(zcr_low),
+                                        zcr_high=float(zcr_high),
+                                        env_thresh=float(env_thresh),
+                                    )
 
-                                    sample_bad_mask_record = build_sample_bad_mask(len(scg_proc_batch), sqa_result_record)
+                                    sample_bad_mask_record = build_sample_bad_mask(
+                                        len(scg_proc_batch),
+                                        sqa_result_record,
+                                    )
 
                                 window_duration = 10.0
                                 if total_duration_batch <= skip_seconds + window_duration:
@@ -2721,26 +2602,21 @@ else:
                                 sqa_result_record = None
                                 sample_bad_mask_record = None
                                 if show_sqa_overlay:
-                                    if sqa_method == "Autocorrelation (Periodicity)":
-                                        sqa_result_record = autocorr_sqa(
-                                            scg_proc_batch,
-                                            fs=fs_proc_batch,
-                                            segment_seconds=float(sqa_segment_seconds),
-                                            min_peak_prominence=float(autocorr_prominence),
-                                            autocorr_threshold=float(autocorr_threshold),
-                                        )
-                                    else:
-                                        sqa_result_record = rms_sqa(
-                                            scg_proc_batch,
-                                            fs=fs_proc_batch,
-                                            segment_seconds=float(sqa_segment_seconds),
-                                            rms_low_percentile=int(rms_low_percentile),
-                                            rms_high_percentile=int(rms_high_percentile),
-                                            rms_low_mad_mult=float(rms_low_mad_mult),
-                                            rms_high_mad_mult=float(rms_high_mad_mult),
-                                        )
+                                    sqa_result_record = combined_sqa_for_signal(
+                                        scg_proc_batch,
+                                        fs=fs_proc_batch,
+                                        segment_seconds=float(sqa_segment_seconds),
+                                        min_flags=int(min_flags_to_reject),
+                                        kurt_thresh=float(kurt_thresh),
+                                        zcr_low=float(zcr_low),
+                                        zcr_high=float(zcr_high),
+                                        env_thresh=float(env_thresh),
+                                    )
 
-                                    sample_bad_mask_record = build_sample_bad_mask(len(scg_proc_batch), sqa_result_record)
+                                    sample_bad_mask_record = build_sample_bad_mask(
+                                        len(scg_proc_batch),
+                                        sqa_result_record,
+                                    )
 
                                 # Initialize accumulators
                                 all_ao_intervals_batch = []

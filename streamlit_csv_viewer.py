@@ -12,6 +12,7 @@ st.caption("Load a saved SCG CSV and inspect waveform, beats, timing, and sampli
 
 
 REQUIRED_COLS = ["timestamp_ms", "x_g", "y_g", "z_g", "beat_event"]
+OPTIONAL_PPG_COL = "ppg_raw"
 
 
 def _read_csv_from_source(uploaded_file, selected_path: str) -> pd.DataFrame:
@@ -31,6 +32,8 @@ def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
     out["y_g"] = pd.to_numeric(out["y_g"], errors="coerce")
     out["z_g"] = pd.to_numeric(out["z_g"], errors="coerce")
     out["beat_event"] = pd.to_numeric(out["beat_event"], errors="coerce").fillna(0).astype(int)
+    if OPTIONAL_PPG_COL in out.columns:
+        out[OPTIONAL_PPG_COL] = pd.to_numeric(out[OPTIONAL_PPG_COL], errors="coerce")
 
     out = out.dropna(subset=["timestamp_ms"]).sort_values("timestamp_ms").reset_index(drop=True)
     return out
@@ -85,6 +88,7 @@ except Exception as exc:
 
 scg_df = df[df[["x_g", "y_g", "z_g"]].notna().any(axis=1)].copy()
 beats_df = df[df["beat_event"] == 1].copy()
+ppg_df = df[df[OPTIONAL_PPG_COL].notna()].copy() if OPTIONAL_PPG_COL in df.columns else pd.DataFrame()
 
 if scg_df.empty:
     st.error("No SCG rows found (x_g/y_g/z_g are empty for all rows).")
@@ -163,7 +167,10 @@ if y_locked:
 st.plotly_chart(fig, use_container_width=True)
 
 
-tab1, tab2, tab3 = st.tabs(["Beat Intervals", "Data Table", "Channel Stats"])
+tab_labels = ["Beat Intervals", "Data Table", "Channel Stats"]
+if not ppg_df.empty:
+    tab_labels.append("PPG Raw")
+tab1, tab2, tab3, *maybe_ppg_tab = st.tabs(tab_labels)
 
 with tab1:
     if len(beats_df) >= 2:
@@ -202,3 +209,39 @@ with tab2:
 with tab3:
     stats_df = view_scg[channels].describe().T
     st.dataframe(stats_df, use_container_width=True)
+
+if maybe_ppg_tab:
+    with maybe_ppg_tab[0]:
+        t0_ppg = float(ppg_df["timestamp_ms"].iloc[0])
+        ppg_df = ppg_df.copy()
+        ppg_df["time_s"] = (ppg_df["timestamp_ms"] - t0_ppg) / 1000.0
+        fig_ppg = go.Figure()
+        fig_ppg.add_trace(
+            go.Scatter(
+                x=ppg_df["time_s"],
+                y=ppg_df[OPTIONAL_PPG_COL],
+                mode="lines",
+                name=OPTIONAL_PPG_COL,
+                line=dict(width=1.2, color="#ff4757"),
+            )
+        )
+        if not beats_df.empty:
+            beat_times = (beats_df["timestamp_ms"] - t0_ppg) / 1000.0
+            for bt in beat_times.to_numpy():
+                fig_ppg.add_vline(
+                    x=float(bt),
+                    line_width=1,
+                    line_dash="dash",
+                    line_color="#00e5ff",
+                    opacity=0.6,
+                )
+        fig_ppg.update_layout(
+            title="PPG Raw",
+            xaxis_title="Time (s)",
+            yaxis_title="Counts",
+            template="plotly_dark",
+            height=420,
+            margin=dict(l=20, r=20, t=50, b=20),
+        )
+        st.plotly_chart(fig_ppg, use_container_width=True)
+        st.dataframe(ppg_df[["timestamp_ms", "time_s", OPTIONAL_PPG_COL]], use_container_width=True, height=220)
