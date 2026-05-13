@@ -79,11 +79,16 @@ def _bandpass_ppg(ppg_signal: np.ndarray, fs: float, low_hz: float, high_hz: flo
     return signal.sosfiltfilt(sos, ppg_signal)
 
 
-def _detect_ppg_peaks(ppg_signal: np.ndarray, fs: float, min_bpm: float, prominence: float) -> np.ndarray:
+def _detect_ppg_peaks(ppg_signal: np.ndarray, fs: float, max_bpm: float, prominence_factor: float) -> np.ndarray:
     if len(ppg_signal) < 3 or fs <= 0:
         return np.array([], dtype=int)
-    min_distance = int(max(1, (60.0 / max(min_bpm, 1.0)) * fs))
-    peaks, _ = signal.find_peaks(ppg_signal, distance=min_distance, prominence=prominence)
+        
+    min_distance = int(max(1, (60.0 / max(max_bpm, 1.0)) * fs))
+    
+    sig_range = np.percentile(ppg_signal, 95) - np.percentile(ppg_signal, 5)
+    dynamic_prom = sig_range * prominence_factor if sig_range > 0 else prominence_factor
+    
+    peaks, _ = signal.find_peaks(ppg_signal, distance=min_distance, prominence=dynamic_prom)
     return peaks.astype(int)
 
 
@@ -739,8 +744,8 @@ with st.sidebar:
     )
     ppg_bp_low = st.number_input("PPG bandpass low (Hz)", min_value=0.1, max_value=10.0, value=0.5, step=0.1)
     ppg_bp_high = st.number_input("PPG bandpass high (Hz)", min_value=1.0, max_value=20.0, value=8.0, step=0.5)
-    ppg_min_bpm = st.number_input("Min BPM for peak distance", min_value=30.0, max_value=200.0, value=40.0, step=5.0)
-    ppg_prom = st.number_input("PPG peak prominence", min_value=0.0, value=0.05, step=0.01)
+    ppg_max_bpm = st.number_input("Max BPM for peak distance", min_value=60.0, max_value=300.0, value=200.0, step=10.0)
+    ppg_prom = st.number_input("PPG peak prominence factor", min_value=0.0, value=0.05, step=0.01)
 
     st.divider()
     st.subheader("Outputs")
@@ -831,7 +836,7 @@ if beat_source == "Detect from PPG raw" and not ppg_df.empty:
     _, ppg_fs = _compute_rate_from_ts(ppg_ts)
     ppg_signal = ppg_df[OPTIONAL_PPG_COL].to_numpy(dtype=float)
     ppg_filtered = _bandpass_ppg(ppg_signal, ppg_fs, float(ppg_bp_low), float(ppg_bp_high))
-    ppg_peaks_idx = _detect_ppg_peaks(ppg_filtered, ppg_fs, float(ppg_min_bpm), float(ppg_prom))
+    ppg_peaks_idx = _detect_ppg_peaks(ppg_filtered, ppg_fs, float(ppg_max_bpm), float(ppg_prom))
     if len(ppg_peaks_idx) > 0:
         beat_times_s = ppg_df["time_s"].to_numpy(dtype=float)[ppg_peaks_idx]
 
@@ -1008,10 +1013,30 @@ if run_window_btn:
 
 st.divider()
 st.subheader("Full Record Analysis")
-full_record_btn = st.button("Analyze Full Record")
+
+col_trim1, col_trim2 = st.columns(2)
+with col_trim1:
+    trim_start = st.number_input("Trim Start (s)", min_value=0.0, max_value=max_t, value=0.0, step=1.0)
+with col_trim2:
+    trim_end = st.number_input("Trim End (s)", min_value=0.0, max_value=max_t, value=max_t, step=1.0)
+
+if trim_start >= trim_end:
+    st.error("Trim Start must be strictly less than Trim End.")
+
+full_record_btn = st.button("Analyze Full Record", disabled=trim_start >= trim_end)
 
 if full_record_btn:
-    st.info(f"Analyzing entire record ({duration_s:.1f}s) using 10-second windows...")
+    start_idx_global = int(trim_start * fs_proc)
+    end_idx_global = int(trim_end * fs_proc)
+    
+    scg_proc_full = scg_proc_full[start_idx_global:end_idx_global]
+    scg_raw = scg_raw[int(trim_start * fs_infer):int(trim_end * fs_infer)]
+    
+    ppg_peaks_full = ppg_peaks_full[(ppg_peaks_full >= start_idx_global) & (ppg_peaks_full < end_idx_global)]
+    ppg_peaks_full = ppg_peaks_full - start_idx_global
+    
+    analysis_duration = trim_end - trim_start
+    st.info(f"Analyzing trimmed record ({analysis_duration:.1f}s) using 10-second windows...")
 
     all_ao_peaks = []
     all_ao_intervals = []
@@ -1089,7 +1114,7 @@ if full_record_btn:
 
             if len(ao_peaks_w) > 1:
                 ao_intervals_w = np.diff(ao_peaks_w) / fs_proc * 1000
-                ao_interval_times_w = (ao_peaks_w[:-1] + ao_peaks_w[1:]) / 2 / fs_proc + window_start
+                ao_interval_times_w = (ao_peaks_w[:-1] + ao_peaks_w[1:]) / 2 / fs_proc + window_start + trim_start
                 all_ao_intervals.extend(ao_intervals_w)
                 all_ao_intervals_times.extend(ao_interval_times_w)
 
@@ -1120,17 +1145,18 @@ if full_record_btn:
         all_ao_intervals_times = all_ao_intervals_times[ao_good_mask]
 
     if save_json_output and len(all_ao_peaks) > 0:
-        saved_file = save_peaks_to_json(all_ao_peaks, fs_proc, file_label, output_folder)
+        global_peaks = all_ao_peaks + int(trim_start * fs_proc)
+        saved_file = save_peaks_to_json(global_peaks, fs_proc, file_label, output_folder)
         st.info(f"AO Peaks saved to: {saved_file}")
 
-    full_time_axis = np.arange(len(scg_proc_full)) / fs_proc
+    full_time_axis = np.arange(len(scg_proc_full)) / fs_proc + trim_start
     if len(scg_raw) == len(scg_proc_full):
         scg_raw_display = scg_raw
     else:
         scg_raw_display = signal.resample(scg_raw, len(scg_proc_full))
     ppg_intervals_full = np.diff(ppg_peaks_full) / fs_proc * 1000.0 if len(ppg_peaks_full) > 1 else np.array([])
     ppg_interval_times_full = (
-        (ppg_peaks_full[:-1] + ppg_peaks_full[1:]) / 2.0 / fs_proc
+        (ppg_peaks_full[:-1] + ppg_peaks_full[1:]) / 2.0 / fs_proc + trim_start
         if len(ppg_peaks_full) > 1
         else np.array([])
     )
@@ -1164,7 +1190,7 @@ if full_record_btn:
     if len(all_ao_peaks) > 0:
         fig_intervals.add_trace(
             go.Scatter(
-                x=all_ao_peaks / fs_proc,
+                x=all_ao_peaks / fs_proc + trim_start,
                 y=scg_raw_display[all_ao_peaks],
                 mode="markers",
                 marker=dict(color="red", size=4, symbol="circle"),
@@ -1215,7 +1241,7 @@ if full_record_btn:
     if len(all_ao_peaks) > 0:
         fig_intervals.add_trace(
             go.Scatter(
-                x=all_ao_peaks / fs_proc,
+                x=all_ao_peaks / fs_proc + trim_start,
                 y=scg_proc_full[all_ao_peaks],
                 mode="markers",
                 marker=dict(color="red", size=4, symbol="circle"),
@@ -1228,7 +1254,7 @@ if full_record_btn:
     if len(ppg_peaks_full) > 0:
         fig_intervals.add_trace(
             go.Scatter(
-                x=ppg_peaks_full / fs_proc,
+                x=ppg_peaks_full / fs_proc + trim_start,
                 y=scg_proc_full[ppg_peaks_full],
                 mode="markers",
                 marker=dict(color="green", size=4, symbol="x"),

@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import TensorDataset, DataLoader
-from sklearn.model_selection import KFold, train_test_split, StratifiedKFold
+from sklearn.model_selection import KFold, train_test_split, StratifiedKFold, LeaveOneGroupOut
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
 import scipy.ndimage
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
@@ -54,7 +54,7 @@ class HVDNetDataLoader:
         self.task_class_names = {
             "Task I": ["AS", "MR", "MS", "AR", "N"],
             "Task I (MS+AR)": ["AS", "MR", "MS+AR (Others)"],
-            "Task I (AS+MR)": ["AS", "MR"],
+            "Task I (AS+MR)": ["AS", "MR", "N"],
             "Task II": ["AS", "AS-MR", "AS-MS", "AS-AR", "AS-TR"],
             "Task III": ["MS", "MR", "AR", "AS", "TR"],
         }
@@ -261,9 +261,9 @@ class HVDNetDataLoader:
             return None
 
         if task_name == "Task I (AS+MR)":
-            # Exact classes: AS, MR (no co-existing diseases, ignore Normal)
+            # Exact classes: AS, MR, N (no co-existing diseases)
             if total_positive == 0:
-                return None
+                return 2  # N
             if tr == 1 or ms == 1 or ar == 1:
                 return None
             if (as_val + mr) != 1:
@@ -388,57 +388,53 @@ class SA_Module(nn.Module):
         return context_vector, weights
 
 
+class FocalLoss(nn.Module):
+    def __init__(self, weight=None, gamma=2.0, reduction='mean'):
+        super(FocalLoss, self).__init__()
+        self.weight = weight
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, weight=self.weight, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = ((1 - pt) ** self.gamma) * ce_loss
+        
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+
 class HVDNet(nn.Module):
     def __init__(self, num_classes=5, d=32):
         super(HVDNet, self).__init__()
 
-        self.scnn_x = sCNN_Module(in_channels=1, base_filters=d)
-        self.scnn_y = sCNN_Module(in_channels=1, base_filters=d)
         self.scnn_z = sCNN_Module(in_channels=1, base_filters=d)
 
-        self.lstm_x = LSTM_Module(input_features=d // 4, hidden_size=d)
-        self.lstm_y = LSTM_Module(input_features=d // 4, hidden_size=d)
-        self.lstm_z = LSTM_Module(input_features=d // 4, hidden_size=d)
+        self.sa_z = SA_Module(hidden_size=d // 4)
 
-        self.sa_x = SA_Module(hidden_size=d)
-        self.sa_y = SA_Module(hidden_size=d)
-        self.sa_z = SA_Module(hidden_size=d)
-
-        self.bn_x = nn.BatchNorm1d(d)
-        self.bn_y = nn.BatchNorm1d(d)
-        self.bn_z = nn.BatchNorm1d(d)
+        self.bn_z = nn.BatchNorm1d(d // 4)
         self.dropout_sa = nn.Dropout(p=0.7)
 
         self.classifier = nn.Sequential(
-            nn.Linear(3 * d, d),
-            nn.ReLU(),
-            nn.BatchNorm1d(d),
-            nn.Dropout(p=0.6),
-            nn.Linear(d, num_classes)
+            nn.Linear(d // 4, num_classes)
         )
 
-    def forward(self, x, y, z):
-        feat_x = self.scnn_x(x)
-        feat_y = self.scnn_y(y)
+    def forward(self, z):
         feat_z = self.scnn_z(z)
 
-        lstm_x = self.lstm_x(feat_x)
-        lstm_y = self.lstm_y(feat_y)
-        lstm_z = self.lstm_z(feat_z)
+        feat_z_seq = feat_z.permute(0, 2, 1)
+        ctx_z, attn_z = self.sa_z(feat_z_seq)
 
-        ctx_x, attn_x = self.sa_x(lstm_x)
-        ctx_y, attn_y = self.sa_y(lstm_y)
-        ctx_z, attn_z = self.sa_z(lstm_z)
-
-        # Apply BN + Dropout after each SA layer (as per paper Fig. a)
-        ctx_x = self.dropout_sa(self.bn_x(ctx_x))
-        ctx_y = self.dropout_sa(self.bn_y(ctx_y))
+        # Apply BN + Dropout after SA layer
         ctx_z = self.dropout_sa(self.bn_z(ctx_z))
 
-        concat_vector = torch.cat((ctx_x, ctx_y, ctx_z), dim=1)
-        logits = self.classifier(concat_vector)
+        logits = self.classifier(ctx_z)
 
-        return logits, (attn_x, attn_y, attn_z)
+        return logits, attn_z
 
 
 class TrainingWorker(QThread):
@@ -449,10 +445,11 @@ class TrainingWorker(QThread):
     error_update = pyqtSignal(str)
 
     def __init__(self, x_tensor, y_tensor, z_tensor, label_tensor, num_classes=5, d=32,
-                 num_epochs=100, batch_size=64, learning_rate=0.001, weight_decay=0.004,
+                 num_epochs=100, batch_size=64, learning_rate=0.001, weight_decay=0.05,
                  test_size=0.2, n_splits=5, random_state=42, multi_label=False,
-                 patient_ids=None, split_by_patient=False, class_names=None, parent=None):
+                 patient_ids=None, cv_mode="Patient-level K-Fold", use_augmentation=True, oversample_minority=False, class_names=None, parent=None):
         super().__init__(parent)
+        self.oversample_minority = oversample_minority
         self.x_tensor = x_tensor
         self.y_tensor = y_tensor
         self.z_tensor = z_tensor
@@ -468,7 +465,8 @@ class TrainingWorker(QThread):
         self.random_state = random_state
         self.multi_label = multi_label
         self.patient_ids = patient_ids
-        self.split_by_patient = split_by_patient
+        self.cv_mode = cv_mode
+        self.use_augmentation = use_augmentation
         self.class_names = class_names
         self._pause_event = threading.Event()
         self._pause_event.set()
@@ -510,7 +508,7 @@ class TrainingWorker(QThread):
                 if self.multi_label:
                     labels = labels.float()
 
-                logits, _ = model(batch_x, batch_y, batch_z)
+                logits, _ = model(batch_z)
                 loss = criterion(logits, labels)
 
                 batch_weight = labels.numel() if self.multi_label else labels.size(0)
@@ -551,7 +549,9 @@ class TrainingWorker(QThread):
             labels_np = self.label_tensor.cpu().numpy()
             all_indices = np.arange(len(labels_np))
 
-            if self.split_by_patient:
+            is_patient_level = self.cv_mode in ("Patient-level K-Fold", "Leave-One-Subject-Out (LOSO)")
+            
+            if is_patient_level:
                 if self.multi_label:
                     raise RuntimeError("Patient-level splitting is not supported for Task III.")
                 if self.patient_ids is None:
@@ -582,24 +582,30 @@ class TrainingWorker(QThread):
                     f"Patient-level class counts (all patients): {patient_class_counts}"
                 )
 
-                unique_classes, class_freq = np.unique(patient_labels, return_counts=True)
-                if len(unique_classes) < 2:
-                    raise RuntimeError("Need at least two classes for patient-level stratified split.")
-                if np.min(class_freq) < 2:
-                    raise RuntimeError("At least one class has fewer than 2 patients; cannot perform stratified 80/20 split.")
+                if self.cv_mode == "Leave-One-Subject-Out (LOSO)":
+                    train_patients = patients
+                    test_patients = np.array([])
+                    self.n_splits = len(patients)
+                    self.log_update.emit(f"LOSO active. Total folds: {self.n_splits}")
+                else:
+                    unique_classes, class_freq = np.unique(patient_labels, return_counts=True)
+                    if len(unique_classes) < 2:
+                        raise RuntimeError("Need at least two classes for patient-level stratified split.")
+                    if np.min(class_freq) < 2:
+                        raise RuntimeError("At least one class has fewer than 2 patients; cannot perform stratified 80/20 split.")
 
-                test_size = compute_stratified_split_size(
-                    len(patients),
-                    len(unique_classes),
-                    self.test_size,
-                )
-                train_patients, test_patients = train_test_split(
-                    patients,
-                    test_size=test_size,
-                    random_state=self.random_state,
-                    shuffle=True,
-                    stratify=patient_labels,
-                )
+                    test_size = compute_stratified_split_size(
+                        len(patients),
+                        len(unique_classes),
+                        self.test_size,
+                    )
+                    train_patients, test_patients = train_test_split(
+                        patients,
+                        test_size=test_size,
+                        random_state=self.random_state,
+                        shuffle=True,
+                        stratify=patient_labels,
+                    )
 
                 train_patient_labels = np.array([patient_to_label[pid] for pid in train_patients])
                 unique_train_labels, train_patient_counts = np.unique(train_patient_labels, return_counts=True)
@@ -610,33 +616,38 @@ class TrainingWorker(QThread):
                 self.log_update.emit(
                     f"Patient-level class counts (train split): {train_class_counts}"
                 )
-                unique_train, train_freq = np.unique(train_patient_labels, return_counts=True)
-                if self.n_splits <= 1:
-                    if np.min(train_freq) < 2:
+                
+                if self.cv_mode != "Leave-One-Subject-Out (LOSO)":
+                    unique_train, train_freq = np.unique(train_patient_labels, return_counts=True)
+                    if self.n_splits <= 1:
+                        if np.min(train_freq) < 2:
+                            underfilled = {
+                                class_name_map[int(label)]: int(count)
+                                for label, count in zip(unique_train, train_freq)
+                                if count < 2
+                            }
+                            raise RuntimeError(
+                                "Need at least 2 patients per class in training split for stratified train/val split. "
+                                f"Minimum class count is {np.min(train_freq)}. "
+                                f"Classes below threshold: {underfilled}."
+                            )
+                    elif np.min(train_freq) < self.n_splits:
                         underfilled = {
                             class_name_map[int(label)]: int(count)
                             for label, count in zip(unique_train, train_freq)
-                            if count < 2
+                            if count < self.n_splits
                         }
                         raise RuntimeError(
-                            "Need at least 2 patients per class in training split for stratified train/val split. "
+                            f"Need at least {self.n_splits} patients per class in training split for StratifiedKFold. "
                             f"Minimum class count is {np.min(train_freq)}. "
                             f"Classes below threshold: {underfilled}."
                         )
-                elif np.min(train_freq) < self.n_splits:
-                    underfilled = {
-                        class_name_map[int(label)]: int(count)
-                        for label, count in zip(unique_train, train_freq)
-                        if count < self.n_splits
-                    }
-                    raise RuntimeError(
-                        f"Need at least {self.n_splits} patients per class in training split for StratifiedKFold. "
-                        f"Minimum class count is {np.min(train_freq)}. "
-                        f"Classes below threshold: {underfilled}."
-                    )
 
                 train_idx = np.concatenate([patient_to_indices[pid] for pid in train_patients]).astype(int)
-                test_idx = np.concatenate([patient_to_indices[pid] for pid in test_patients]).astype(int)
+                if len(test_patients) > 0:
+                    test_idx = np.concatenate([patient_to_indices[pid] for pid in test_patients]).astype(int)
+                else:
+                    test_idx = np.array([], dtype=int)
                 splitter = None
             elif self.multi_label:
                 if len(labels_np) < 2:
@@ -677,44 +688,38 @@ class TrainingWorker(QThread):
                     )
                 splitter = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
 
-            if self.split_by_patient:
+            if is_patient_level:
                 train_patient_count = len(np.unique(np.asarray(self.patient_ids)[train_idx]))
-                test_patient_count = len(np.unique(np.asarray(self.patient_ids)[test_idx]))
+                test_patient_count = len(np.unique(np.asarray(self.patient_ids)[test_idx])) if len(test_idx) > 0 else 0
                 self.log_update.emit(
-                    f"80/20 split done (patient-level): train={len(train_idx)} samples ({train_patient_count} patients), "
+                    f"split done (patient-level): train={len(train_idx)} samples ({train_patient_count} patients), "
                     f"test={len(test_idx)} samples ({test_patient_count} patients)"
                 )
             else:
                 self.log_update.emit(f"80/20 split done: train={len(train_idx)} samples, test={len(test_idx)} samples")
 
-            x_test = self.x_tensor[test_idx]
-            y_test = self.y_tensor[test_idx]
-            z_test = self.z_tensor[test_idx]
-            label_test = self.label_tensor[test_idx]
-            test_loader = DataLoader(
-                TensorDataset(x_test, y_test, z_test, label_test),
-                batch_size=self.batch_size,
-                shuffle=False,
-            )
-
-            # Initialize model once — weights carry over across folds
-            model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
-            classifier_params = list(model.classifier.parameters())
-            classifier_param_ids = {id(p) for p in classifier_params}
-            other_params = [p for p in model.parameters() if id(p) not in classifier_param_ids]
-            optimizer = torch.optim.AdamW(
-                [
-                    {"params": other_params, "weight_decay": 0.0},
-                    {"params": classifier_params, "weight_decay": self.weight_decay},
-                ],
-                lr=self.learning_rate,
-            )
+            if len(test_idx) > 0:
+                x_test = self.x_tensor[test_idx]
+                y_test = self.y_tensor[test_idx]
+                z_test = self.z_tensor[test_idx]
+                label_test = self.label_tensor[test_idx]
+                test_loader = DataLoader(
+                    TensorDataset(x_test, y_test, z_test, label_test),
+                    batch_size=self.batch_size,
+                    shuffle=False,
+                )
+            else:
+                test_loader = None
+                x_test = self.x_tensor[:0]
+                y_test = self.y_tensor[:0]
+                z_test = self.z_tensor[:0]
+                label_test = self.label_tensor[:0]
 
             best_val_loss = float('inf')
             best_fold = -1
             best_state_dict = None
 
-            if self.split_by_patient:
+            if is_patient_level:
                 patient_ids_np = np.asarray(self.patient_ids)
                 patient_to_indices = {}
                 for idx, patient_id in enumerate(patient_ids_np):
@@ -722,7 +727,10 @@ class TrainingWorker(QThread):
                 train_patients = np.unique(patient_ids_np[train_idx])
                 train_patient_labels = np.array([int(labels_np[patient_ids_np == pid][0]) for pid in train_patients])
 
-                if self.n_splits <= 1:
+                if self.cv_mode == "Leave-One-Subject-Out (LOSO)":
+                    splitter = LeaveOneGroupOut()
+                    split_iter = splitter.split(train_patients, train_patient_labels, groups=train_patients)
+                elif self.n_splits <= 1:
                     val_size = compute_stratified_split_size(
                         len(train_patients),
                         len(np.unique(train_patient_labels)),
@@ -748,8 +756,8 @@ class TrainingWorker(QThread):
 
             for fold_idx, (fold_train_rel, fold_val_rel) in enumerate(split_iter, start=1):
                 self.wait_if_paused()
-                if self.split_by_patient:
-                    if self.n_splits <= 1:
+                if is_patient_level:
+                    if self.n_splits <= 1 and self.cv_mode != "Leave-One-Subject-Out (LOSO)":
                         fold_train_patients = fold_train_rel
                         fold_val_patients = fold_val_rel
                     else:
@@ -769,6 +777,45 @@ class TrainingWorker(QThread):
                 y_train = self.y_tensor[fold_train_idx]
                 z_train = self.z_tensor[fold_train_idx]
                 label_train = self.label_tensor[fold_train_idx]
+
+                if self.oversample_minority and not self.multi_label:
+                    train_counts = np.bincount(label_train.cpu().numpy())
+                    if len(train_counts) > 0:
+                        max_count = train_counts.max()
+                        oversampled_x = [x_train]
+                        oversampled_y = [y_train]
+                        oversampled_z = [z_train]
+                        oversampled_labels = [label_train]
+
+                        class_name_map = self.class_names or [str(i) for i in range(self.num_classes)]
+                        added_per_class = {}
+                        for class_idx, count in enumerate(train_counts):
+                            if 0 < count < max_count:
+                                num_samples_needed = max_count - count
+                                class_indices = (label_train == class_idx).nonzero(as_tuple=True)[0]
+                                sampled_indices = class_indices[torch.randint(0, len(class_indices), (num_samples_needed,))]
+
+                                oversampled_x.append(x_train[sampled_indices])
+                                oversampled_y.append(y_train[sampled_indices])
+                                oversampled_z.append(z_train[sampled_indices])
+                                oversampled_labels.append(label_train[sampled_indices])
+                                added_per_class[class_name_map[class_idx]] = int(num_samples_needed)
+
+                        x_train = torch.cat(oversampled_x, dim=0)
+                        y_train = torch.cat(oversampled_y, dim=0)
+                        z_train = torch.cat(oversampled_z, dim=0)
+                        label_train = torch.cat(oversampled_labels, dim=0)
+
+                        if added_per_class:
+                            added_str = ', '.join(f'{cls}=+{n}' for cls, n in added_per_class.items())
+                            new_counts = np.bincount(label_train.cpu().numpy(), minlength=self.num_classes)
+                            new_counts_str = ', '.join(
+                                f'{class_name_map[i]}={new_counts[i]}'
+                                for i in range(len(train_counts))
+                            )
+                            self.log_update.emit(
+                                f" > Oversampling: {added_str} | New counts: [{new_counts_str}]"
+                            )
 
                 x_val = self.x_tensor[fold_val_idx]
                 y_val = self.y_tensor[fold_val_idx]
@@ -791,13 +838,10 @@ class TrainingWorker(QThread):
                     criterion = nn.BCEWithLogitsLoss()
                 else:
                     fold_class_weights, fold_counts = self.compute_class_weights(label_train.cpu().numpy())
-                    criterion = nn.CrossEntropyLoss(weight=fold_class_weights.to(device))
+                    criterion = FocalLoss(weight=fold_class_weights.to(device), gamma=2.0)
 
-                # Reset only the classifier head for each new fold
-                def reset_linear(m):
-                    if isinstance(m, nn.Linear):
-                        m.reset_parameters()
-                model.classifier.apply(reset_linear)
+                # Re-initialize the entire model for each new fold to prevent data leakage across folds
+                model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
                 classifier_params = list(model.classifier.parameters())
                 classifier_param_ids = {id(p) for p in classifier_params}
                 other_params = [
@@ -835,11 +879,21 @@ class TrainingWorker(QThread):
                         batch_y = move_tensor_to_device(batch_y, device)
                         batch_z = move_tensor_to_device(batch_z, device)
                         labels = move_tensor_to_device(labels, device)
+                        if self.use_augmentation and model.training:
+                            noise_std = 0.05
+                            batch_x = batch_x + torch.randn_like(batch_x) * noise_std
+                            batch_y = batch_y + torch.randn_like(batch_y) * noise_std
+                            batch_z = batch_z + torch.randn_like(batch_z) * noise_std
+                            scale = torch.empty(batch_x.size(0), 1, 1).uniform_(0.8, 1.2).to(device)
+                            batch_x = batch_x * scale
+                            batch_y = batch_y * scale
+                            batch_z = batch_z * scale
+                            
                         if self.multi_label:
                             labels = labels.float()
 
                         optimizer.zero_grad()
-                        logits, _ = model(batch_x, batch_y, batch_z)
+                        logits, _ = model(batch_z)
                         loss = criterion(logits, labels)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -899,7 +953,10 @@ class TrainingWorker(QThread):
                 test_criterion = nn.BCEWithLogitsLoss()
             else:
                 test_criterion = nn.CrossEntropyLoss()
-            test_loss, test_acc = self.evaluate_loader(model, test_criterion, test_loader, device)
+            if test_loader is not None:
+                test_loss, test_acc = self.evaluate_loader(model, test_criterion, test_loader, device)
+            else:
+                test_loss, test_acc = best_val_loss, 0.0
             self.test_update.emit(test_loss, test_acc)
 
             self.finished_update.emit({
@@ -910,6 +967,7 @@ class TrainingWorker(QThread):
                 'test_acc': test_acc,
                 'train_size': int(len(train_idx)),
                 'test_size': int(len(test_idx)),
+                'num_classes': self.num_classes,
                 'test_tensors': {
                     'x': x_test.detach().cpu(),
                     'y': y_test.detach().cpu(),
@@ -1031,8 +1089,20 @@ class HVDMainWindow(QMainWindow):
         self.balance_classes_checkbox = QCheckBox("Balance classes (cap patients at 2x smallest)")
         self.balance_classes_checkbox.setToolTip("Limits patients per class for Task I, Task I (MS+AR), Task I (AS+MR), and Task II.")
         self.balance_classes_checkbox.setChecked(True)
-        self.patient_split_checkbox = QCheckBox("Split by patient (Task I / Task I (MS+AR) / Task I (AS+MR))")
-        self.patient_split_checkbox.setToolTip("Keep all segments from a patient in the same split for Task I, Task I (MS+AR), and Task I (AS+MR).")
+        
+        self.cv_strategy_dropdown = QComboBox()
+        self.cv_strategy_dropdown.addItems(["Standard K-Fold", "Patient-level K-Fold", "Leave-One-Subject-Out (LOSO)"])
+        self.cv_strategy_dropdown.setCurrentText("Patient-level K-Fold")
+        self.cv_strategy_dropdown.setToolTip("Select the cross-validation strategy.")
+
+        self.augmentation_checkbox = QCheckBox("Enable Time-Series Augmentation")
+        self.augmentation_checkbox.setToolTip("Adds random noise and scaling to SCG signals during training to prevent overfitting.")
+        self.augmentation_checkbox.setChecked(True)
+        
+        self.oversample_checkbox = QCheckBox("Oversample Minority Classes")
+        self.oversample_checkbox.setToolTip("Randomly duplicates segments from minority classes so that all classes have the same number of samples during training.")
+        self.oversample_checkbox.setChecked(True)
+        
         self.pause_resume_btn = QPushButton("Pause Training")
         self.pause_resume_btn.clicked.connect(self.step_toggle_training_pause)
         self.load_model_btn = QPushButton("Load Saved\nModel")
@@ -1106,7 +1176,9 @@ class HVDMainWindow(QMainWindow):
         input_layout.addWidget(self.step8_btn)
         input_layout.addWidget(self.small_training_mode)
         input_layout.addWidget(self.balance_classes_checkbox)
-        input_layout.addWidget(self.patient_split_checkbox)
+        input_layout.addWidget(self.cv_strategy_dropdown)
+        input_layout.addWidget(self.augmentation_checkbox)
+        input_layout.addWidget(self.oversample_checkbox)
         input_layout.addWidget(self.step9_btn)
         input_layout.addWidget(self.pause_resume_btn)
         input_layout.addWidget(self.load_model_btn)
@@ -1281,7 +1353,7 @@ class HVDMainWindow(QMainWindow):
         self.refresh_class_attention_class_selector()
         self.update_step_controls()
         self.update_navigation_controls()
-        self.patient_split_checkbox.setEnabled(self.task_selector.currentText() in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"))
+        self.cv_strategy_dropdown.setEnabled(self.task_selector.currentText() in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"))
 
     def log(self, message):
         self.console.append(message)
@@ -1306,11 +1378,11 @@ class HVDMainWindow(QMainWindow):
     def on_task_changed(self, task_name):
         self.refresh_class_attention_class_selector()
         self.populate_patient_dropdown(task_name)
-        if hasattr(self, 'patient_split_checkbox'):
+        if hasattr(self, 'cv_strategy_dropdown'):
             is_task1 = task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)")
-            self.patient_split_checkbox.setEnabled(is_task1)
+            self.cv_strategy_dropdown.setEnabled(is_task1)
             if not is_task1:
-                self.patient_split_checkbox.setChecked(False)
+                self.cv_strategy_dropdown.setCurrentText("Standard K-Fold")
         if hasattr(self, 'balance_classes_checkbox'):
             supports_balance = task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
             self.balance_classes_checkbox.setEnabled(supports_balance)
@@ -1829,8 +1901,6 @@ class HVDMainWindow(QMainWindow):
         model.eval()
         with torch.no_grad():
             logits, _ = model(
-                move_tensor_to_device(patient_data['x_batch'], device),
-                move_tensor_to_device(patient_data['y_batch'], device),
                 move_tensor_to_device(patient_data['z_batch'], device),
             )
             segment_probabilities = torch.sigmoid(logits).cpu().numpy()
@@ -1967,9 +2037,9 @@ class HVDMainWindow(QMainWindow):
         z_features = self.current_data['cnn_outputs']['z_features']
 
         self.lstm_models = {
-            'x': LSTM_Module(input_features=16, hidden_size=32),
-            'y': LSTM_Module(input_features=16, hidden_size=32),
-            'z': LSTM_Module(input_features=16, hidden_size=32)
+            'x': LSTM_Module(input_features=16, hidden_size=64),
+            'y': LSTM_Module(input_features=16, hidden_size=64),
+            'z': LSTM_Module(input_features=16, hidden_size=64)
         }
 
         for model in self.lstm_models.values():
@@ -1987,10 +2057,10 @@ class HVDMainWindow(QMainWindow):
         }
 
         self.log("[SUCCESS] Three axis-specific LSTM modules initialized.")
-        self.log("[CONFIG] input_features=16, hidden_size=32, num_layers=1, batch_first=True")
+        self.log("[CONFIG] input_features=16, hidden_size=64, num_layers=1, batch_first=True")
         self.log("[CHECKPOINT] X-axis verification:")
         self.log(f" > X sCNN input to LSTM: {tuple(x_features.shape)} (batch, 16, 100)")
-        self.log(f" > X LSTM output shape: {tuple(x_lstm_out.shape)} (batch, 100, 32)")
+        self.log(f" > X LSTM output shape: {tuple(x_lstm_out.shape)} (batch, 100, 64)")
         self.log(f" > Y LSTM output shape: {tuple(y_lstm_out.shape)}")
         self.log(f" > Z LSTM output shape: {tuple(z_lstm_out.shape)}")
         self.log(" > Outputs are ready for axis-specific self-attention modules.")
@@ -2009,9 +2079,9 @@ class HVDMainWindow(QMainWindow):
         z_lstm_out = self.current_data['lstm_outputs']['z_lstm_out']
 
         self.sa_models = {
-            'x': SA_Module(hidden_size=32),
-            'y': SA_Module(hidden_size=32),
-            'z': SA_Module(hidden_size=32)
+            'x': SA_Module(hidden_size=64),
+            'y': SA_Module(hidden_size=64),
+            'z': SA_Module(hidden_size=64)
         }
 
         for model in self.sa_models.values():
@@ -2033,10 +2103,10 @@ class HVDMainWindow(QMainWindow):
 
         self.log("[SUCCESS] Axis-specific SA modules initialized.")
         self.log("[CHECKPOINT] Attention verification:")
-        self.log(f" > X LSTM input to SA: {tuple(x_lstm_out.shape)} (batch, 100, 32)")
-        self.log(f" > X context vector shape: {tuple(x_context.shape)} (batch, 32)")
-        self.log(f" > Y context vector shape: {tuple(y_context.shape)} (batch, 32)")
-        self.log(f" > Z context vector shape: {tuple(z_context.shape)} (batch, 32)")
+        self.log(f" > X LSTM input to SA: {tuple(x_lstm_out.shape)} (batch, 100, 64)")
+        self.log(f" > X context vector shape: {tuple(x_context.shape)} (batch, 64)")
+        self.log(f" > Y context vector shape: {tuple(y_context.shape)} (batch, 64)")
+        self.log(f" > Z context vector shape: {tuple(z_context.shape)} (batch, 64)")
         self.log(" > Raw attention weights are stored for later heatmap generation.")
         self.update_step_controls()
         self.log("Next: click 'Step 8: Build HVDNet + Final Check'.")
@@ -2055,23 +2125,17 @@ class HVDMainWindow(QMainWindow):
         dummy_z = torch.randn(520, 1, 800)
 
         with torch.no_grad():
-            logits, attention_weights = self.hvdnet_model(dummy_x, dummy_y, dummy_z)
-
-        attn_x, attn_y, attn_z = attention_weights
+            logits, attn_z = self.hvdnet_model(dummy_z)
 
         self.current_data['hvdnet_outputs'] = {
             'logits': logits,
-            'attention_weights': attention_weights
+            'attention_weights': attn_z
         }
 
-        self.log("[SUCCESS] HVDNet initialized with late-fusion axis-specific branches.")
+        self.log("[SUCCESS] HVDNet initialized with late-fusion Z-axis branch.")
         self.log("[CHECKPOINT] Full network forward pass:")
-        self.log(f" > dummy_x shape: {tuple(dummy_x.shape)}")
-        self.log(f" > dummy_y shape: {tuple(dummy_y.shape)}")
         self.log(f" > dummy_z shape: {tuple(dummy_z.shape)}")
         self.log(f" > logits shape: {tuple(logits.shape)} (batch, 5)")
-        self.log(f" > attention_x shape: {tuple(attn_x.shape)}")
-        self.log(f" > attention_y shape: {tuple(attn_y.shape)}")
         self.log(f" > attention_z shape: {tuple(attn_z.shape)}")
         self.log(f" > Active task: {task_name} | Classes: {class_names}")
 
@@ -2270,20 +2334,19 @@ class HVDMainWindow(QMainWindow):
             )
             dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
 
-            split_by_patient = (
-                task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)")
-                and hasattr(self, 'patient_split_checkbox')
-                and self.patient_split_checkbox.isChecked()
-            )
-            if task_name not in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)") and hasattr(self, 'patient_split_checkbox') and self.patient_split_checkbox.isChecked():
-                self.log("[INFO] Patient-level split is only supported for Task I, Task I (MS+AR), and Task I (AS+MR). Using segment-level split.")
-                split_by_patient = False
+            cv_mode = "Standard K-Fold"
+            if hasattr(self, 'cv_strategy_dropdown'):
+                cv_mode = self.cv_strategy_dropdown.currentText()
+                if task_name not in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"):
+                    self.log("[INFO] Specific CV strategy is only supported for Task I, Task I (MS+AR), and Task I (AS+MR). Using Standard K-Fold.")
+                    cv_mode = "Standard K-Fold"
 
             is_small_training = self.small_training_mode.currentIndex() == 1
-            if task_name in ("Task I (MS+AR)", "Task I (AS+MR)"):
-                num_epochs = 50
-                n_splits = 2
-            elif split_by_patient:
+            if cv_mode == "Leave-One-Subject-Out (LOSO)":
+                num_epochs = 50 if is_small_training else 100
+                patient_ids_list = dataset_info.get('patient_ids')
+                n_splits = len(np.unique(patient_ids_list)) if patient_ids_list else -1
+            elif cv_mode == "Patient-level K-Fold" and task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"):
                 num_epochs = 100
                 n_splits = 1
             else:
@@ -2311,18 +2374,20 @@ class HVDMainWindow(QMainWindow):
                 y_tensor=dataset_info['y_tensor'],
                 z_tensor=dataset_info['z_tensor'],
                 label_tensor=dataset_info['label_tensor'],
-                num_classes=5,
+                num_classes=len(dataset_info['class_names']),
                 d=64,
                 num_epochs=num_epochs,
                 batch_size=64,
                 learning_rate=0.001,
-                weight_decay=0.004,
+                weight_decay=0.05,
                 test_size=0.2,
                 n_splits=n_splits,
                 random_state=42,
                 multi_label=(task_name == "Task III"),
                 patient_ids=dataset_info.get('patient_ids'),
-                split_by_patient=split_by_patient,
+                cv_mode=cv_mode,
+                use_augmentation=self.augmentation_checkbox.isChecked() if hasattr(self, 'augmentation_checkbox') else False,
+                oversample_minority=self.oversample_checkbox.isChecked() if hasattr(self, 'oversample_checkbox') else False,
                 class_names=dataset_info.get('class_names'),
             )
             self.training_worker.log_update.connect(self.log)
@@ -2336,10 +2401,12 @@ class HVDMainWindow(QMainWindow):
             self.log("[INFO] Training started in a background thread to keep the UI responsive.")
             if task_name == "Task III":
                 self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold KFold on train pool.")
-            elif split_by_patient:
+            elif cv_mode == "Patient-level K-Fold":
                 self.log(
                     "[INFO] Split strategy: patient-level 80/20 stratified split, then a single stratified train/val split (no CV)."
                 )
+            elif cv_mode == "Leave-One-Subject-Out (LOSO)":
+                self.log("[INFO] Split strategy: Leave-One-Subject-Out (LOSO) on all available patients.")
             elif task_name in ("Task I (MS+AR)", "Task I (AS+MR)"):
                 self.log("[INFO] Split strategy: 80% train pool / 20% held-out test, then 2-fold stratified CV on train pool.")
             else:
@@ -2388,7 +2455,7 @@ class HVDMainWindow(QMainWindow):
         self.last_test_tensors = summary.get('test_tensors')
         self.last_test_task_name = self.current_training_task
         self.last_test_class_names = summary.get('test_class_names')
-        self.hvdnet_model = HVDNet(num_classes=5, d=64)
+        self.hvdnet_model = HVDNet(num_classes=summary['num_classes'], d=64)
         self.hvdnet_model.load_state_dict(summary['best_state_dict'])
         self.loaded_model_task = self.current_training_task
         self.loaded_model_classes = self.loader.get_task_class_names(self.current_training_task)
@@ -2434,7 +2501,7 @@ class HVDMainWindow(QMainWindow):
         state_dict_cpu = {k: v.detach().cpu() for k, v in self.hvdnet_model.state_dict().items()}
         payload = {
             'model_state_dict': state_dict_cpu,
-            'num_classes': 5,
+            'num_classes': len(class_names),
             'd': 64,
             'task_name': task_name,
             'class_names': class_names,
@@ -2464,7 +2531,8 @@ class HVDMainWindow(QMainWindow):
             task_name = self.task_selector.currentText()
             class_names = self.loader.get_task_class_names(task_name)
 
-        self.hvdnet_model = HVDNet(num_classes=5, d=64)
+        num_classes = payload.get('num_classes', len(class_names)) if isinstance(payload, dict) and 'model_state_dict' in payload else len(class_names)
+        self.hvdnet_model = HVDNet(num_classes=num_classes, d=64)
         self.hvdnet_model.load_state_dict(state_dict)
         self.hvdnet_model.eval()
 
@@ -2597,13 +2665,9 @@ class HVDMainWindow(QMainWindow):
         segment_results = []
         signal_length = int(data['signal_length'])
         full_attention_sum = {
-            'X': np.zeros(signal_length, dtype=float),
-            'Y': np.zeros(signal_length, dtype=float),
             'Z': np.zeros(signal_length, dtype=float),
         }
         full_attention_count = {
-            'X': np.zeros(signal_length, dtype=float),
-            'Y': np.zeros(signal_length, dtype=float),
             'Z': np.zeros(signal_length, dtype=float),
         }
 
@@ -2614,9 +2678,7 @@ class HVDMainWindow(QMainWindow):
                     data['filtered_signals'],
                     segment,
                 )
-                logits, (attn_x, attn_y, attn_z) = model(
-                    move_tensor_to_device(x_tensor, device),
-                    move_tensor_to_device(y_tensor, device),
+                logits, attn_z = model(
                     move_tensor_to_device(z_tensor, device),
                 )
 
@@ -2629,8 +2691,6 @@ class HVDMainWindow(QMainWindow):
                     true_label = self.loader.map_label_row_to_task_index(data['labels'], task_name)
 
                 attn_arrays = {
-                    'X': attn_x.squeeze().detach().cpu().numpy(),
-                    'Y': attn_y.squeeze().detach().cpu().numpy(),
                     'Z': attn_z.squeeze().detach().cpu().numpy(),
                 }
 
@@ -2655,8 +2715,6 @@ class HVDMainWindow(QMainWindow):
                     'signal_y': data['filtered_signals']['AccY'][segment['start_idx']:segment['end_idx']],
                     'signal_z': data['filtered_signals']['AccZ'][segment['start_idx']:segment['end_idx']],
                     'signal_ecg': data['filtered_signals']['ECG'][segment['start_idx']:segment['end_idx']],
-                    'attention_x': attn_arrays['X'],
-                    'attention_y': attn_arrays['Y'],
                     'attention_z': attn_arrays['Z'],
                     'probabilities': segment_probabilities,
                     'prediction': segment_prediction,
@@ -2664,7 +2722,7 @@ class HVDMainWindow(QMainWindow):
                 })
 
         full_attention = {}
-        for axis_name in ('X', 'Y', 'Z'):
+        for axis_name in ('Z',):
             full_attention[axis_name] = np.divide(
                 full_attention_sum[axis_name],
                 full_attention_count[axis_name],
@@ -2734,9 +2792,10 @@ class HVDMainWindow(QMainWindow):
         ecg_plot.clear()
 
         title = f"Patient {patient_id} - {stage_name} | {title_prefix}"
-        if attention_maps is not None:
-            self.plot_attention_overlay(accx, attention_maps['X'], accx_plot, 'X', title)
-            self.plot_attention_overlay(accy, attention_maps['Y'], accy_plot, 'Y', title)
+        if attention_maps is not None and 'Z' in attention_maps:
+            accx_plot.setTitle(title)
+            accx_plot.plot(t, accx, pen=pg.mkPen('#1f77b4', width=1))
+            accy_plot.plot(t, accy, pen=pg.mkPen('#ff7f0e', width=1))
             self.plot_attention_overlay(accz, attention_maps['Z'], accz_plot, 'Z', title)
         else:
             accx_plot.setTitle(title)
@@ -2902,8 +2961,6 @@ class HVDMainWindow(QMainWindow):
             with torch.no_grad():
                 for bx, by, bz, bl in test_loader:
                     logits, _ = self.hvdnet_model(
-                        move_tensor_to_device(bx, device),
-                        move_tensor_to_device(by, device),
                         move_tensor_to_device(bz, device),
                     )
                     if is_multilabel:
@@ -3030,11 +3087,10 @@ class HVDMainWindow(QMainWindow):
         except Exception as e:
             self.log(f"[ERROR] Confusion matrix generation failed: {str(e)}")
 
-    def get_mean_attention_for_class(self, model, test_dataset, target_class_idx, axis_name='X', num_samples=50, task_name="Task I"):
+    def get_mean_attention_for_class(self, model, test_dataset, target_class_idx, axis_name='Z', num_samples=50, task_name="Task I"):
         model.eval()
         device = next(model.parameters()).device
 
-        signal_key = axis_name.upper()
         collected_signals = []
         collected_attention = []
         count = 0
@@ -3049,21 +3105,12 @@ class HVDMainWindow(QMainWindow):
                     if int(label.item()) != int(target_class_idx):
                         continue
 
-                x_input = move_tensor_to_device(x.unsqueeze(0), device)
-                y_input = move_tensor_to_device(y.unsqueeze(0), device)
                 z_input = move_tensor_to_device(z.unsqueeze(0), device)
 
-                _, (attn_x, attn_y, attn_z) = model(x_input, y_input, z_input)
+                _, attn_z = model(z_input)
 
-                if signal_key == 'X':
-                    collected_signals.append(x.squeeze().cpu().numpy())
-                    collected_attention.append(attn_x.squeeze().detach().cpu().numpy())
-                elif signal_key == 'Y':
-                    collected_signals.append(y.squeeze().cpu().numpy())
-                    collected_attention.append(attn_y.squeeze().detach().cpu().numpy())
-                else:
-                    collected_signals.append(z.squeeze().cpu().numpy())
-                    collected_attention.append(attn_z.squeeze().detach().cpu().numpy())
+                collected_signals.append(z.squeeze().cpu().numpy())
+                collected_attention.append(attn_z.squeeze().detach().cpu().numpy())
 
                 count += 1
                 if count >= num_samples:
@@ -3122,7 +3169,7 @@ class HVDMainWindow(QMainWindow):
 
             self.class_attention_widget.clear()
             class_axis_plots = []
-            for row_idx, axis_name in enumerate(("X", "Y", "Z")):
+            for row_idx, axis_name in enumerate(("Z",)):
                 mean_signal, mean_attn, count = self.get_mean_attention_for_class(
                     self.hvdnet_model,
                     test_dataset,
@@ -3528,8 +3575,10 @@ class HVDMainWindow(QMainWindow):
                 f"Inference | Segment {segment['segment_idx'] + 1}/{len(segment_results)} | "
                 f"{result['title_prefix']}"
             )
-            self.plot_attention_overlay(segment['signal_x'], segment['attention_x'], self.inf_accx_plot, 'X', segment_title)
-            self.plot_attention_overlay(segment['signal_y'], segment['attention_y'], self.inf_accy_plot, 'Y', segment_title)
+            self.inf_accx_plot.plot(np.arange(len(segment['signal_x'])), segment['signal_x'], pen=pg.mkPen('#1f77b4', width=1))
+            self.inf_accx_plot.setTitle(segment_title + " | X")
+            self.inf_accy_plot.plot(np.arange(len(segment['signal_y'])), segment['signal_y'], pen=pg.mkPen('#ff7f0e', width=1))
+            self.inf_accy_plot.setTitle(segment_title + " | Y")
             self.plot_attention_overlay(segment['signal_z'], segment['attention_z'], self.inf_accz_plot, 'Z', segment_title)
             self.inf_ecg_plot.clear()
             self.inf_ecg_plot.plot(np.arange(len(segment['signal_ecg'])), segment['signal_ecg'], pen=pg.mkPen('#d62728', width=1))
