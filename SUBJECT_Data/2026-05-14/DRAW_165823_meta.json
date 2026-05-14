@@ -1,0 +1,16 @@
+{
+  "session_start": "2026-05-14T16:58:23.636291",
+  "patient_initials": "DRAW",
+  "age": 21,
+  "sex": "Male",
+  "weight_kg": 60.0,
+  "height_cm": 168.0,
+  "bmi": 21.3,
+  "cardiac_conditions": [
+    "Normal"
+  ],
+  "notes": "",
+  "sample_rate_scg_hz": 256,
+  "sample_rate_ppg_hz": 100,
+  "filter_enabled": true
+}

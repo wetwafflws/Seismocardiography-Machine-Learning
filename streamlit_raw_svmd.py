@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import os
 import time
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -16,6 +17,8 @@ from scipy.stats import kurtosis
 
 REQUIRED_COLS = ["timestamp_ms", "x_g", "y_g", "z_g", "beat_event"]
 OPTIONAL_PPG_COL = "ppg_raw"
+DEFAULT_SEARCH_DIR = "SUBJECT_Data"
+META_SUFFIX = "_meta.json"
 
 
 st.set_page_config(page_title="Raw SCG SVMD", layout="wide")
@@ -24,9 +27,28 @@ st.caption("Run SVMD on your raw SCG CSV with PPG beat references.")
 
 
 def _read_csv_from_source(uploaded_file, selected_path: str) -> pd.DataFrame:
+    read_kwargs = {
+        "comment": "#",
+        "engine": "python",
+    }
     if uploaded_file is not None:
-        return pd.read_csv(uploaded_file)
-    return pd.read_csv(selected_path)
+        return pd.read_csv(uploaded_file, **read_kwargs)
+    return pd.read_csv(selected_path, **read_kwargs)
+
+
+def _resolve_meta_path(csv_path: str) -> Path:
+    csv_file = Path(csv_path)
+    return csv_file.with_name(f"{csv_file.stem}{META_SUFFIX}")
+
+
+def _read_metadata_for_csv(csv_path: str) -> tuple[Optional[dict], str]:
+    if not csv_path:
+        return None, ""
+    meta_path = _resolve_meta_path(csv_path)
+    if not meta_path.exists():
+        return None, str(meta_path)
+    with meta_path.open("r", encoding="utf-8") as handle:
+        return json.load(handle), str(meta_path)
 
 
 def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -664,10 +686,17 @@ with st.sidebar:
     selected_file_path = ""
 
     if source_mode == "Workspace CSV":
-        search_dir = st.text_input("Search folder", value=".")
+        search_dir = st.text_input("Search folder", value=DEFAULT_SEARCH_DIR)
         path_obj = Path(search_dir)
         if path_obj.exists() and path_obj.is_dir():
-            candidates = sorted(path_obj.glob("*.csv"))
+            date_folders = sorted([p for p in path_obj.iterdir() if p.is_dir()])
+            if date_folders:
+                selected_day = st.selectbox("Day folder", [p.name for p in date_folders])
+                day_path = path_obj / selected_day
+                candidates = sorted(day_path.glob("*.csv"))
+            else:
+                candidates = sorted(path_obj.glob("*.csv"))
+
             if candidates:
                 selected = st.selectbox("CSV file", [str(p) for p in candidates])
                 selected_file_path = selected
@@ -685,7 +714,7 @@ with st.sidebar:
     st.divider()
     st.subheader("Preprocessing")
     use_mti = st.checkbox("Apply Complete Preprocessing (MTI, Detrend, Median)", value=True)
-    target_fs = st.number_input("Processing sample rate (Hz)", min_value=50, max_value=1000, value=500, step=50)
+    target_fs = st.number_input("Processing sample rate (Hz)", min_value=50, max_value=1000, value=256, step=50)
 
     st.divider()
     st.subheader("SQA: Signal Quality Assessment")
@@ -749,7 +778,7 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Outputs")
-    save_json_output = st.checkbox("Save AO Peaks to JSON", value=True)
+    save_json_output = st.checkbox("Save AO Peaks to JSON", value=False)
     output_folder = st.text_input("Output Folder", value="Saved_Peaks")
 
 
@@ -757,12 +786,26 @@ if uploaded is None and not selected_file_path:
     st.info("Select or upload a CSV file to begin.")
     st.stop()
 
+meta_data = None
+meta_path_display = ""
+if uploaded is None and selected_file_path:
+    try:
+        meta_data, meta_path_display = _read_metadata_for_csv(selected_file_path)
+    except Exception as exc:
+        st.warning(f"Failed to read metadata: {exc}")
+
 try:
     raw_df = _read_csv_from_source(uploaded, selected_file_path)
     df = _prepare_df(raw_df)
 except Exception as exc:
     st.error(f"Failed to load CSV: {exc}")
     st.stop()
+
+if meta_data is not None:
+    st.subheader("Session Metadata")
+    st.json(meta_data)
+    if meta_path_display:
+        st.caption(f"Metadata file: {meta_path_display}")
 
 scg_df = df[df[["x_g", "y_g", "z_g"]].notna().any(axis=1)].copy()
 beats_df = df[df["beat_event"] == 1].copy()
@@ -830,13 +873,31 @@ beat_times_s = beats_df["time_s"].to_numpy(dtype=float) if len(beats_df) > 0 els
 ppg_filtered = None
 ppg_peaks_idx = np.array([], dtype=int)
 ppg_fs = 0.0
+ppg_vis_filtered = None
+ppg_vis_peaks_idx = np.array([], dtype=int)
+ppg_vis_fs = 0.0
+
+if not ppg_df.empty:
+    ppg_ts = ppg_df["timestamp_ms"].to_numpy(dtype=float)
+    _, ppg_vis_fs = _compute_rate_from_ts(ppg_ts)
+    ppg_signal = ppg_df[OPTIONAL_PPG_COL].to_numpy(dtype=float)
+    ppg_vis_filtered = _bandpass_ppg(
+        ppg_signal,
+        ppg_vis_fs,
+        float(ppg_bp_low),
+        float(ppg_bp_high),
+    )
+    ppg_vis_peaks_idx = _detect_ppg_peaks(
+        ppg_vis_filtered,
+        ppg_vis_fs,
+        float(ppg_max_bpm),
+        float(ppg_prom),
+    )
 
 if beat_source == "Detect from PPG raw" and not ppg_df.empty:
-    ppg_ts = ppg_df["timestamp_ms"].to_numpy(dtype=float)
-    _, ppg_fs = _compute_rate_from_ts(ppg_ts)
-    ppg_signal = ppg_df[OPTIONAL_PPG_COL].to_numpy(dtype=float)
-    ppg_filtered = _bandpass_ppg(ppg_signal, ppg_fs, float(ppg_bp_low), float(ppg_bp_high))
-    ppg_peaks_idx = _detect_ppg_peaks(ppg_filtered, ppg_fs, float(ppg_max_bpm), float(ppg_prom))
+    ppg_filtered = ppg_vis_filtered
+    ppg_fs = ppg_vis_fs
+    ppg_peaks_idx = ppg_vis_peaks_idx
     if len(ppg_peaks_idx) > 0:
         beat_times_s = ppg_df["time_s"].to_numpy(dtype=float)[ppg_peaks_idx]
 
@@ -1161,19 +1222,35 @@ if full_record_btn:
         else np.array([])
     )
 
+    has_ppg_vis = ppg_vis_filtered is not None and not ppg_df.empty
     st.subheader("Signals and Interval Time Series")
-    fig_intervals = make_subplots(
-        rows=3,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.05,
-        subplot_titles=(
-            "Raw SCG with AO Peaks",
-            "Processed SCG with AO Peaks and PPG Beats",
-            "PPG-PPG and AO-AO Intervals",
-        ),
-        row_heights=[0.35, 0.35, 0.3],
-    )
+    if has_ppg_vis:
+        fig_intervals = make_subplots(
+            rows=4,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(
+                "Raw SCG with AO Peaks",
+                "Processed SCG with AO Peaks and PPG Beats",
+                "Processed PPG with Peaks",
+                "PPG-PPG and AO-AO Intervals",
+            ),
+            row_heights=[0.3, 0.3, 0.2, 0.2],
+        )
+    else:
+        fig_intervals = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.05,
+            subplot_titles=(
+                "Raw SCG with AO Peaks",
+                "Processed SCG with AO Peaks and PPG Beats",
+                "PPG-PPG and AO-AO Intervals",
+            ),
+            row_heights=[0.35, 0.35, 0.3],
+        )
 
     fig_intervals.add_trace(
         go.Scatter(
@@ -1264,6 +1341,42 @@ if full_record_btn:
             col=1,
         )
 
+    intervals_row = 3
+    if has_ppg_vis:
+        ppg_time_full = ppg_df["time_s"].to_numpy(dtype=float)
+        ppg_mask = (ppg_time_full >= trim_start) & (ppg_time_full <= trim_end)
+        ppg_time_trim = ppg_time_full[ppg_mask]
+        ppg_filtered_trim = ppg_vis_filtered[ppg_mask]
+        ppg_peaks_in_trim = ppg_vis_peaks_idx[
+            (ppg_time_full[ppg_vis_peaks_idx] >= trim_start)
+            & (ppg_time_full[ppg_vis_peaks_idx] <= trim_end)
+        ]
+
+        fig_intervals.add_trace(
+            go.Scatter(
+                x=ppg_time_trim,
+                y=ppg_filtered_trim,
+                mode="lines",
+                line=dict(color="#ff4757", width=0.9),
+                name="PPG (Filtered)",
+            ),
+            row=3,
+            col=1,
+        )
+        if len(ppg_peaks_in_trim) > 0:
+            fig_intervals.add_trace(
+                go.Scatter(
+                    x=ppg_time_full[ppg_peaks_in_trim],
+                    y=ppg_vis_filtered[ppg_peaks_in_trim],
+                    mode="markers",
+                    marker=dict(color="#00e5ff", size=5, symbol="circle"),
+                    name="PPG Peaks",
+                ),
+                row=3,
+                col=1,
+            )
+        intervals_row = 4
+
     if len(ppg_interval_times_full) > 0:
         fig_intervals.add_trace(
             go.Scatter(
@@ -1274,7 +1387,7 @@ if full_record_btn:
                 marker=dict(size=3),
                 name="PPG-PPG Intervals",
             ),
-            row=3,
+            row=intervals_row,
             col=1,
         )
 
@@ -1288,7 +1401,7 @@ if full_record_btn:
                 marker=dict(size=3),
                 name="AO-AO Intervals",
             ),
-            row=3,
+            row=intervals_row,
             col=1,
         )
 
@@ -1301,10 +1414,12 @@ if full_record_btn:
     )
     fig_intervals.update_xaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
     fig_intervals.update_yaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
-    fig_intervals.update_xaxes(title_text="Time (s)", row=3, col=1)
+    fig_intervals.update_xaxes(title_text="Time (s)", row=intervals_row, col=1)
     fig_intervals.update_yaxes(title_text="Raw SCG", row=1, col=1)
     fig_intervals.update_yaxes(title_text="Processed SCG", row=2, col=1)
-    fig_intervals.update_yaxes(title_text="Interval (ms)", row=3, col=1)
+    if has_ppg_vis:
+        fig_intervals.update_yaxes(title_text="PPG (Filtered)", row=3, col=1)
+    fig_intervals.update_yaxes(title_text="Interval (ms)", row=intervals_row, col=1)
     st.plotly_chart(fig_intervals, use_container_width=True)
 
     if len(all_ao_peaks) > 1 and len(ppg_peaks_full) > 1:
