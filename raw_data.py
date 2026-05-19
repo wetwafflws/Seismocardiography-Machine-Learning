@@ -826,16 +826,26 @@ class MainWindow(QMainWindow):
         self._segment_dirty = False
 
         # ── Filter ────────────────────────────────────────────────────────────
-        self._filter_on = False
-        self._notch_on  = False
-        self._bpf_sos   = butter(2, [BPF_LOW_HZ, BPF_HIGH_HZ],
-                                 btype='bandpass', fs=SAMPLE_RATE, output='sos')
-        # Notch at 50 Hz: Q=30 gives a -3 dB bandwidth of ~1.7 Hz — narrow
-        # enough to kill mains hum without touching the 40-50 Hz SCG content.
+        self._filter_on  = False
+        self._notch_on   = False
+        self._artifact_rejection_on = False
+        self._bpf_sos    = butter(2, [BPF_LOW_HZ, BPF_HIGH_HZ],
+                                  btype='bandpass', fs=SAMPLE_RATE, output='sos')
+        # Notch at 50 Hz: Q=30 gives a -3 dB bandwidth of ~1.7 Hz
         from scipy.signal import iirnotch, tf2sos as _tf2sos
-        _b, _a      = iirnotch(50.0, Q=30, fs=SAMPLE_RATE)
-        self._notch_sos = _tf2sos(_b, _a)
+        _b, _a           = iirnotch(50.0, Q=30, fs=SAMPLE_RATE)
+        self._notch_sos  = _tf2sos(_b, _a)
         self._reset_filter_state()
+        # Artifact rejection rolling window (1 second = 256 samples)
+        AR_WIN          = SAMPLE_RATE
+        self._ar_win    = AR_WIN
+        self._ar_buf_x  = np.zeros(AR_WIN, dtype=np.float64)
+        self._ar_buf_y  = np.zeros(AR_WIN, dtype=np.float64)
+        self._ar_buf_z  = np.zeros(AR_WIN, dtype=np.float64)
+        self._ar_idx    = 0
+        self._ar_full   = False
+        self._ar_prev   = None       # last accepted (xg, yg, zg)
+        self._ar_rejected_count = 0
 
         # ── Serial ────────────────────────────────────────────────────────────
         self._thread: ReaderThread | None = None
@@ -986,6 +996,7 @@ class MainWindow(QMainWindow):
         self._stat_beats = self._stat_row(sl, "BEATS",        "0")
         self._stat_rate  = self._stat_row(sl, "SAMPLE RATE",  "-- Hz")
         self._stat_lost  = self._stat_row(sl, "PARSE ERRORS", "0")
+        self._stat_ar    = self._stat_row(sl, "REJECTED",     "0")
         layout.addWidget(stats_card)
 
         # Subject card
@@ -1062,6 +1073,9 @@ class MainWindow(QMainWindow):
         self._notch_cb.setEnabled(False)   # only active when bandpass is on
         self._notch_cb.toggled.connect(self._on_notch_toggled)
         cfg_l.addWidget(self._notch_cb)
+        self._artifact_cb = QCheckBox("ARTIFACT REJECTION")
+        self._artifact_cb.toggled.connect(self._on_artifact_toggled)
+        cfg_l.addWidget(self._artifact_cb)
         self._host_time_cb = QCheckBox("USE PC TIME AXIS")
         self._host_time_cb.toggled.connect(lambda c: self._set_host_time(c))
         cfg_l.addWidget(self._host_time_cb)
@@ -1220,6 +1234,95 @@ class MainWindow(QMainWindow):
         self._notch_on = checked
         self._reset_filter_state()   # flush transient state so no click on toggle
 
+    def _on_artifact_toggled(self, checked: bool):
+        self._artifact_rejection_on = checked
+        # Reset the rolling window and previous-sample memory so toggling
+        # mid-stream doesn't seed the statistics with stale data.
+        self._ar_buf_x[:] = 0.0
+        self._ar_buf_y[:] = 0.0
+        self._ar_buf_z[:] = 0.0
+        self._ar_idx  = 0
+        self._ar_full = False
+        self._ar_prev = None
+
+    def _artifact_reject(self, xg: float, yg: float, zg: float):
+        """
+        Impulse artifact rejection using a rolling median ± k·MAD gate.
+
+        Algorithm
+        ---------
+        1.  Push the new raw sample into a 1-second circular buffer.
+        2.  Once the buffer is at least half full, compute the median and
+            MAD (median absolute deviation) of the buffered values.
+        3.  If |sample − median| > AR_THRESHOLD × MAD on ANY axis, the
+            sample is an outlier.  Replace it with the last accepted value
+            (hold) — simple and causal, adds zero latency.
+        4.  Update the rolling buffer with the (possibly replaced) value
+            so one spike does not permanently bias the statistics.
+
+        Why MAD instead of std-dev
+        --------------------------
+        Standard deviation is itself corrupted by the spike (a 10 g transient
+        inflates σ by several g, making the threshold uselessly wide).  MAD is
+        resistant to outliers: one spike in 256 samples barely moves the median
+        or the MAD, so the threshold stays tight around the true signal level.
+
+        Threshold k = 8
+        ----------------
+        SCG peak-to-peak at the sensor is typically 0.05–0.3 g; MAD of the
+        filtered signal is ~0.02–0.10 g.  Real cardiac peaks therefore sit
+        well within 8 × MAD.  Electrical transients from cable flex are
+        typically 1–5 g, i.e. 10–250 × MAD — caught easily.
+        Tunable via AR_THRESHOLD constant if needed.
+        """
+        AR_THRESHOLD = 8.0
+        MIN_SAMPLES  = self._ar_win // 2   # wait for half a window before gating
+
+        # Write raw sample into rolling buffer first
+        self._ar_buf_x[self._ar_idx] = xg
+        self._ar_buf_y[self._ar_idx] = yg
+        self._ar_buf_z[self._ar_idx] = zg
+        self._ar_idx = (self._ar_idx + 1) % self._ar_win
+        if self._ar_idx == 0:
+            self._ar_full = True
+
+        n_valid = self._ar_win if self._ar_full else self._ar_idx
+        if n_valid < MIN_SAMPLES or self._ar_prev is None:
+            # Not enough history yet — pass through and record as accepted
+            self._ar_prev = (xg, yg, zg)
+            return xg, yg, zg
+
+        # Compute robust statistics on the current window
+        buf_x = self._ar_buf_x if self._ar_full else self._ar_buf_x[:n_valid]
+        buf_y = self._ar_buf_y if self._ar_full else self._ar_buf_y[:n_valid]
+        buf_z = self._ar_buf_z if self._ar_full else self._ar_buf_z[:n_valid]
+
+        med_x = np.median(buf_x);  mad_x = np.median(np.abs(buf_x - med_x))
+        med_y = np.median(buf_y);  mad_y = np.median(np.abs(buf_y - med_y))
+        med_z = np.median(buf_z);  mad_z = np.median(np.abs(buf_z - med_z))
+
+        # Gate: reject if any axis is an outlier
+        # Use max(mad, 0.001) floor so a perfectly flat signal (mad≈0) doesn't
+        # reject every sample due to floating-point rounding.
+        is_artifact = (
+            abs(xg - med_x) > AR_THRESHOLD * max(mad_x, 0.001) or
+            abs(yg - med_y) > AR_THRESHOLD * max(mad_y, 0.001) or
+            abs(zg - med_z) > AR_THRESHOLD * max(mad_z, 0.001)
+        )
+
+        if is_artifact:
+            self._ar_rejected_count += 1
+            # Hold: replace with last good sample; overwrite the buffer entry
+            # we just wrote so the spike doesn't bias future statistics.
+            px, py, pz = self._ar_prev
+            self._ar_buf_x[(self._ar_idx - 1) % self._ar_win] = px
+            self._ar_buf_y[(self._ar_idx - 1) % self._ar_win] = py
+            self._ar_buf_z[(self._ar_idx - 1) % self._ar_win] = pz
+            return px, py, pz
+
+        self._ar_prev = (xg, yg, zg)
+        return xg, yg, zg
+
     def _apply_scg_yrange(self):
         """
         When the bandpass filter is on, pin each SCG plot's y-axis to ±1 g so
@@ -1277,6 +1380,8 @@ class MainWindow(QMainWindow):
             xg = raw_to_g(x_raw)
             yg = raw_to_g(y_raw)
             zg = raw_to_g(z_raw)
+            if self._artifact_rejection_on:
+                xg, yg, zg = self._artifact_reject(xg, yg, zg)
             if self._filter_on:
                 xg, yg, zg = self._apply_filter(xg, yg, zg)
 
@@ -1504,6 +1609,7 @@ class MainWindow(QMainWindow):
     def _refresh_stats(self):
         self._stat_beats.setText(str(len(self._beat_ts)))
         self._stat_lost.setText(str(self._parse_err_count))
+        self._stat_ar.setText(str(self._ar_rejected_count))
         if len(self._beat_intervals) >= 2:
             bpm = 60000.0 / float(np.mean(self._beat_intervals))
             self._bpm_label.setText(f"{bpm:.0f}")
@@ -1704,6 +1810,13 @@ class MainWindow(QMainWindow):
         self._last_beat_hts = None
         self._sample_count  = 0
         self._parse_err_count = 0
+        self._ar_rejected_count = 0
+        self._ar_buf_x[:] = 0.0
+        self._ar_buf_y[:] = 0.0
+        self._ar_buf_z[:] = 0.0
+        self._ar_idx  = 0
+        self._ar_full = False
+        self._ar_prev = None
         self._beat_ts_snapshot = []
         for cache in self._beat_line_cache:
             for _, line in cache:

@@ -698,6 +698,8 @@ def compare_intervals(ao_peaks, r_peaks, fs):
     diff_intervals = ao_intervals_ms - rr_intervals_ms
     mean_diff = np.mean(diff_intervals)
     std_diff = np.std(diff_intervals)
+    upper_loa = mean_diff + 1.96 * std_diff
+    lower_loa = mean_diff - 1.96 * std_diff
 
     paper_metrics = compute_paper_metrics(ao_intervals_ms, rr_intervals_ms)
 
@@ -713,9 +715,168 @@ def compare_intervals(ao_peaks, r_peaks, fs):
         "mae": mae,
         "mean_diff": mean_diff,
         "std_diff": std_diff,
+        "upper_loa": upper_loa,
+        "lower_loa": lower_loa,
         "mean_intervals": mean_intervals,
         "diff_intervals": diff_intervals,
         "paper_metrics": paper_metrics,
+    }
+
+
+def _iqr_inlier_mask(values):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return np.array([], dtype=bool)
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = q3 - q1
+    if not np.isfinite(iqr) or iqr == 0:
+        return np.ones(values.shape, dtype=bool)
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    return (values >= lower) & (values <= upper)
+
+
+def _estimate_peak_lag_samples(detected_peaks, reference_peaks, fs):
+    detected = np.asarray(detected_peaks, dtype=float)
+    reference = np.asarray(reference_peaks, dtype=float)
+    if detected.size == 0 or reference.size == 0:
+        return 0.0
+    if reference.size > 1:
+        median_ref_samples = np.median(np.diff(np.sort(reference)))
+    else:
+        median_ref_samples = np.median(np.diff(np.sort(detected))) if detected.size > 1 else 0.0
+
+    if not np.isfinite(median_ref_samples) or median_ref_samples <= 0:
+        return 0.0
+
+    max_lag_samples = int(max(1, 0.5 * median_ref_samples))
+    diffs = []
+    for ref in reference:
+        lo = ref - max_lag_samples
+        hi = ref + max_lag_samples
+        nearby = detected[(detected >= lo) & (detected <= hi)]
+        if nearby.size:
+            diffs.extend(nearby - ref)
+
+    if len(diffs) == 0:
+        return 0.0
+
+    diffs_int = np.round(np.asarray(diffs)).astype(int)
+    offset = -int(diffs_int.min())
+    counts = np.bincount(diffs_int + offset)
+    best_lag = int(np.argmax(counts)) - offset
+    return float(best_lag)
+
+
+def _ptt_window_samples(lag_samples, fs, tolerance_seconds=0.1):
+    tolerance_samples = float(tolerance_seconds) * fs
+    min_lag = -0.35 * fs
+    max_lag = -0.15 * fs
+    window_min = max(lag_samples - tolerance_samples, min_lag)
+    window_max = min(lag_samples + tolerance_samples, max_lag)
+    if window_min >= window_max:
+        window_min = min_lag
+        window_max = max_lag
+    return window_min, window_max
+
+
+def _match_peaks_by_lag(detected_peaks, reference_peaks, fs, tolerance_seconds=0.1):
+    detected = np.asarray(detected_peaks, dtype=float)
+    reference = np.asarray(reference_peaks, dtype=float)
+    if detected.size == 0 or reference.size == 0:
+        return [], []
+
+    detected = np.sort(detected)
+    reference = np.sort(reference)
+    lag_samples = _estimate_peak_lag_samples(detected, reference, fs)
+    window_min, window_max = _ptt_window_samples(lag_samples, fs, tolerance_seconds)
+
+    used = np.zeros(len(detected), dtype=bool)
+    matched_detected = []
+    matched_reference = []
+
+    for ref_idx, ref in enumerate(reference):
+        candidates = np.where(
+            (~used)
+            & (detected - ref >= window_min)
+            & (detected - ref <= window_max)
+        )[0]
+        if len(candidates) == 0:
+            continue
+        closest_idx = candidates[np.argmin(np.abs(detected[candidates] - ref))]
+        used[closest_idx] = True
+        matched_detected.append(int(closest_idx))
+        matched_reference.append(int(ref_idx))
+
+    return matched_detected, matched_reference
+
+
+def _match_peaks_by_time(detected_peaks, reference_peaks, fs, tolerance_seconds=0.1):
+    detected = np.asarray(detected_peaks, dtype=float)
+    reference = np.asarray(reference_peaks, dtype=float)
+    if detected.size == 0 or reference.size == 0:
+        return np.array([], dtype=bool), np.array([], dtype=bool)
+
+    detected_s = np.sort(detected) / float(fs)
+    reference_s = np.sort(reference) / float(fs)
+    used = np.zeros(len(detected_s), dtype=bool)
+    matched_ref = np.zeros(len(reference_s), dtype=bool)
+
+    for ref_idx, ref in enumerate(reference_s):
+        lo = ref - float(tolerance_seconds)
+        hi = ref + float(tolerance_seconds)
+        left = np.searchsorted(detected_s, lo, side="left")
+        right = np.searchsorted(detected_s, hi, side="right")
+        if left >= right:
+            continue
+        window_used = ~used[left:right]
+        if not np.any(window_used):
+            continue
+        candidates = np.where(window_used)[0] + left
+        closest_idx = candidates[np.argmin(np.abs(detected_s[candidates] - ref))]
+        used[closest_idx] = True
+        matched_ref[ref_idx] = True
+
+    return used, matched_ref
+
+
+def compute_ptt_metrics(ao_peaks, ppg_peaks, fs, tolerance_seconds=0.1):
+    ao_peaks = np.asarray(ao_peaks, dtype=float)
+    ppg_peaks = np.asarray(ppg_peaks, dtype=float)
+    if ao_peaks.size == 0 or ppg_peaks.size == 0:
+        return None
+
+    ao_sorted = np.sort(ao_peaks)
+    ppg_sorted = np.sort(ppg_peaks)
+    matched_ao_idx, matched_ppg_idx = _match_peaks_by_lag(
+        ao_sorted, ppg_sorted, fs, tolerance_seconds
+    )
+    if len(matched_ao_idx) == 0:
+        return None
+
+    ptt_ms = (
+        ppg_sorted[np.asarray(matched_ppg_idx)] - ao_sorted[np.asarray(matched_ao_idx)]
+    ) / fs * 1000.0
+
+    ao_intervals_ms = np.diff(ao_sorted) / fs * 1000.0
+    ao_interval_series = []
+    ptt_series = []
+    for ao_idx, ptt_value in zip(matched_ao_idx, ptt_ms):
+        if ao_idx == 0:
+            continue
+        ao_interval_series.append(ao_intervals_ms[ao_idx - 1])
+        ptt_series.append(ptt_value)
+
+    ptt_corr = (
+        np.corrcoef(ptt_series, ao_interval_series)[0, 1]
+        if len(ptt_series) > 1
+        else np.nan
+    )
+
+    return {
+        "mean_ptt_ms": float(np.mean(ptt_ms)),
+        "std_ptt_ms": float(np.std(ptt_ms)),
+        "ptt_rr_correlation": ptt_corr,
     }
 
 
@@ -757,11 +918,22 @@ def match_intervals_by_time(ao_peaks, r_peaks, fs):
             matched_ao_centers.append(ao_center)
             matched_rr_centers.append(rr_centers_s[nearest_idx])
 
+    matched_ao = np.asarray(matched_ao, dtype=float)
+    matched_rr = np.asarray(matched_rr, dtype=float)
+    matched_ao_centers = np.asarray(matched_ao_centers, dtype=float)
+    matched_rr_centers = np.asarray(matched_rr_centers, dtype=float)
+    if matched_ao.size == 0 or matched_rr.size == 0:
+        return np.array([]), np.array([]), np.array([]), np.array([])
+
+    ao_mask = _iqr_inlier_mask(matched_ao)
+    rr_mask = _iqr_inlier_mask(matched_rr)
+    keep_mask = ao_mask & rr_mask
+
     return (
-        np.asarray(matched_ao, dtype=float),
-        np.asarray(matched_rr, dtype=float),
-        np.asarray(matched_ao_centers, dtype=float),
-        np.asarray(matched_rr_centers, dtype=float),
+        matched_ao[keep_mask],
+        matched_rr[keep_mask],
+        matched_ao_centers[keep_mask],
+        matched_rr_centers[keep_mask],
     )
 
 
@@ -774,6 +946,14 @@ def compute_paper_metrics(ao_intervals_ms, rr_intervals_ms):
     if len(ao_intervals_ms) == 0 or len(rr_intervals_ms) == 0:
         return None
 
+    ao_mask = _iqr_inlier_mask(ao_intervals_ms)
+    rr_mask = _iqr_inlier_mask(rr_intervals_ms)
+    keep_mask = ao_mask & rr_mask
+    ao_intervals_ms = ao_intervals_ms[keep_mask]
+    rr_intervals_ms = rr_intervals_ms[keep_mask]
+    if len(ao_intervals_ms) == 0 or len(rr_intervals_ms) == 0:
+        return None
+
     ao_hr = 60000.0 / ao_intervals_ms
     rr_hr = 60000.0 / rr_intervals_ms
 
@@ -783,48 +963,39 @@ def compute_paper_metrics(ao_intervals_ms, rr_intervals_ms):
     aae = float(np.mean(np.abs(ao_hr - rr_hr)))
     aaep = float(np.mean(np.abs(ao_hr - rr_hr) / rr_hr) * 100.0)
 
+    diff_intervals = ao_intervals_ms - rr_intervals_ms
+    bias = float(np.mean(diff_intervals))
+    std_diff = float(np.std(diff_intervals))
+    loa_upper = bias + 1.96 * std_diff
+    loa_lower = bias - 1.96 * std_diff
+
     return {
         "ARE": are,
         "AAE": aae,
         "AAEP": aaep,
         "mean_scg_hr": mean_scg_hr,
         "mean_ecg_hr": mean_ecg_hr,
+        "ba_bias": bias,
+        "ba_upper_loa": loa_upper,
+        "ba_lower_loa": loa_lower,
     }
 
 
-def compute_detection_metrics(detected_peaks, reference_peaks, fs, tolerance_seconds=0.15):
+def compute_detection_metrics(detected_peaks, reference_peaks, fs, tolerance_seconds=0.1):
     """
     Compute TP/FP/FN and detection metrics using greedy one-to-one matching.
     """
     detected = np.asarray(detected_peaks, dtype=float)
     reference = np.asarray(reference_peaks, dtype=float)
-    tolerance_samples = float(tolerance_seconds) * fs
     if len(reference) == 0:
         return None
 
-    detected = np.sort(detected)
-    reference = np.sort(reference)
-    pep_min_samples = 0.03 * fs
-    pep_max_samples = 0.35 * fs
-
-    used = np.zeros(len(detected), dtype=bool)
-    tp = 0
-    fn = 0
-
-    for ref in reference:
-        candidates = np.where(
-            (~used)
-            & (detected - ref >= pep_min_samples)
-            & (detected - ref <= pep_max_samples)
-        )[0]
-        if len(candidates) == 0:
-            fn += 1
-            continue
-        closest_idx = candidates[np.argmin(np.abs(detected[candidates] - ref))]
-        used[closest_idx] = True
-        tp += 1
-
+    used, matched_ref = _match_peaks_by_time(
+        detected, reference, fs, tolerance_seconds
+    )
+    tp = int(np.sum(matched_ref))
     fp = int(np.sum(~used))
+    fn = int(np.sum(~matched_ref))
 
     se = tp / (tp + fn) * 100.0 if (tp + fn) > 0 else np.nan
     p = tp / (tp + fp) * 100.0 if (tp + fp) > 0 else np.nan
@@ -2195,6 +2366,7 @@ else:
                                     "Start Time (s)": "N/A",
                                     "Peaks": "N/A",
                                     "Heart Rate (BPM)": "N/A",
+                                    "Correlation": "N/A",
                                     "IMFs": "N/A",
                                     "Status": "Skipped (duration <= 70s)"
                                 })
@@ -2206,6 +2378,7 @@ else:
                             signals_r = record_r[0]
 
                             scg_proc_r, fs_proc_r = resample_for_processing(signals_r[:, 3], fs_r, target_fs=500)
+                            ecg_proc_r, _ = resample_for_processing(signals_r[:, 0], fs_r, target_fs=500)
                             if use_mti:
                                 scg_proc_r = apply_mti_filter(scg_proc_r)
 
@@ -2213,6 +2386,7 @@ else:
                             end_idx_r = int((start_time_r + 10) * fs_proc_r)
 
                             scg_for_svmd_r = scg_proc_r[start_idx_r:end_idx_r]
+                            ecg_window_r = ecg_proc_r[start_idx_r:end_idx_r]
                             fs_svmd_r = fs_proc_r
 
                             modes_r, omegas_r = svmd(scg_for_svmd_r, max_alpha=svmd_alpha, tau=0, stopc=3)
@@ -2222,6 +2396,7 @@ else:
                                     "Start Time (s)": f"{start_time_r:.2f}",
                                     "Peaks": "N/A",
                                     "Heart Rate (BPM)": "N/A",
+                                    "Correlation": "N/A",
                                     "IMFs": "0",
                                     "Status": "SVMD returned no modes"
                                 })
@@ -2233,6 +2408,16 @@ else:
                             s_ao_7_r, envelope_r, smoothed_env_r, peaks_r = extract_ao_peaks(
                                 s_ao_plot_r, fs_proc_r, prominence_factor, power=power_exp
                             )
+
+                            r_peaks_r, _, _ = detect_r_peaks(ecg_window_r, fs_proc_r)
+                            ao_intervals_matched, rr_intervals_matched, _, _ = match_intervals_by_time(
+                                peaks_r, r_peaks_r, fs_proc_r
+                            )
+                            if len(ao_intervals_matched) > 1:
+                                correlation = np.corrcoef(ao_intervals_matched, rr_intervals_matched)[0, 1]
+                                corr_text = f"{correlation:.3f}"
+                            else:
+                                corr_text = "N/A"
 
                             if len(peaks_r) > 1:
                                 ao_ao_intervals = np.diff(peaks_r) / fs_proc_r
@@ -2246,6 +2431,7 @@ else:
                                 "Start Time (s)": f"{start_time_r:.2f}",
                                 "Peaks": f"{len(peaks_r)}",
                                 "Heart Rate (BPM)": hr_text,
+                                "Correlation": corr_text,
                                 "IMFs": f"{len(selected_idx_r)}/{len(modes_r)}",
                                 "Status": "OK"
                             })
@@ -2256,6 +2442,7 @@ else:
                                 "Start Time (s)": "N/A",
                                 "Peaks": "N/A",
                                 "Heart Rate (BPM)": "N/A",
+                                "Correlation": "N/A",
                                 "IMFs": "N/A",
                                 "Status": f"Error: {e}"
                             })
@@ -2275,6 +2462,7 @@ else:
                 with st.expander(expander_title, expanded=False):
                     st.write(f"**Start Time (s):** {result['Start Time (s)']}")
                     st.write(f"**Peaks:** {result['Peaks']}")
+                    st.write(f"**Correlation:** {result['Correlation']}")
                     st.write(f"**Heart Rate (BPM):** {result['Heart Rate (BPM)']}")
                     st.write(f"**IMFs:** {result['IMFs']}")
 

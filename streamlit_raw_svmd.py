@@ -154,6 +154,18 @@ def apply_mti_filter(raw_signal):
     return y_smoothed
 
 
+def apply_scg_bandpass(raw_signal, fs, low_hz=1.0, high_hz=40.0):
+    if fs <= 0:
+        return raw_signal
+    nyq = 0.5 * fs
+    low = max(0.01, float(low_hz)) / nyq
+    high = min(0.99 * nyq, float(high_hz)) / nyq
+    if low >= high:
+        return raw_signal
+    sos = signal.butter(4, [low, high], btype="bandpass", output="sos")
+    return signal.sosfiltfilt(sos, raw_signal)
+
+
 def svmd(signal_in, max_alpha=2000, tau=0, tol=1e-6, stopc=3, init_omega=0):
     signal_in = np.array(signal_in).flatten()
     if len(signal_in) % 2 > 0:
@@ -563,12 +575,147 @@ def build_sample_bad_mask(signal_len, sqa_result):
     return sample_bad
 
 
-def match_intervals_by_time(ao_peaks, ref_peaks, fs):
+def _iqr_inlier_mask(values):
+    values = np.asarray(values, dtype=float)
+    if values.size == 0:
+        return np.array([], dtype=bool)
+    q1, q3 = np.percentile(values, [25, 75])
+    iqr = q3 - q1
+    if not np.isfinite(iqr) or iqr == 0:
+        return np.ones(values.shape, dtype=bool)
+    lower = q1 - 1.5 * iqr
+    upper = q3 + 1.5 * iqr
+    return (values >= lower) & (values <= upper)
+
+
+def _estimate_peak_lag_samples(detected_peaks, reference_peaks, fs_ao, fs_ref):
+    detected = np.asarray(detected_peaks, dtype=float)
+    reference = np.asarray(reference_peaks, dtype=float)
+    if detected.size == 0 or reference.size == 0:
+        return 0.0
+
+    detected_s = detected / float(fs_ao)
+    reference_s = reference / float(fs_ref)
+    min_lag_s = 0.05
+    max_lag_s = 0.50
+    if max_lag_s <= min_lag_s:
+        return 0.0
+
+    diffs = []
+    for ref in reference_s:
+        lo = ref - max_lag_s
+        hi = ref - min_lag_s
+        nearby = detected_s[(detected_s >= lo) & (detected_s <= hi)]
+        if nearby.size:
+            diffs.extend(nearby - ref)
+
+    if len(diffs) == 0:
+        return 0.0
+
+    diffs = np.asarray(diffs, dtype=float)
+    bin_width = 0.001
+    diffs_int = np.round(diffs / bin_width).astype(int)
+    offset = -int(diffs_int.min())
+    counts = np.bincount(diffs_int + offset)
+    best_lag = (int(np.argmax(counts)) - offset) * bin_width
+    return float(best_lag)
+
+
+def _ptt_window_samples(lag_seconds, tolerance_seconds=0.15):
+    window_min = lag_seconds - float(tolerance_seconds)
+    window_max = lag_seconds + float(tolerance_seconds)
+    if window_min >= window_max:
+        window_min = lag_seconds - float(tolerance_seconds)
+        window_max = lag_seconds + float(tolerance_seconds)
+    return window_min, window_max
+
+
+def _match_peaks_by_lag(detected_peaks, reference_peaks, fs_ao, fs_ref, tolerance_seconds=0.15):
+    detected = np.asarray(detected_peaks, dtype=float)
+    reference = np.asarray(reference_peaks, dtype=float)
+    if detected.size == 0 or reference.size == 0:
+        return [], []
+
+    detected = np.sort(detected)
+    reference = np.sort(reference)
+    detected_s = detected / float(fs_ao)
+    reference_s = reference / float(fs_ref)
+    lag_seconds = _estimate_peak_lag_samples(detected, reference, fs_ao, fs_ref)
+    window_min, window_max = _ptt_window_samples(lag_seconds, tolerance_seconds)
+
+    used = np.zeros(len(detected_s), dtype=bool)
+    matched_detected = []
+    matched_reference = []
+
+    for ref_idx, ref in enumerate(reference_s):
+        candidates = np.where(
+            (~used)
+            & (detected_s - ref >= window_min)
+            & (detected_s - ref <= window_max)
+        )[0]
+        if len(candidates) == 0:
+            continue
+        closest_idx = candidates[np.argmin(np.abs(detected_s[candidates] - ref))]
+        used[closest_idx] = True
+        matched_detected.append(int(closest_idx))
+        matched_reference.append(int(ref_idx))
+
+    return matched_detected, matched_reference
+
+
+def compute_ptt_metrics(ao_peaks, ppg_peaks, fs_ao, fs_ref, tolerance_seconds=0.15):
+    ao_peaks = np.asarray(ao_peaks, dtype=float)
+    ppg_peaks = np.asarray(ppg_peaks, dtype=float)
+    if ao_peaks.size == 0 or ppg_peaks.size == 0:
+        return None
+
+    ao_sorted = np.sort(ao_peaks)
+    ppg_sorted = np.sort(ppg_peaks)
+    ao_s = ao_sorted / float(fs_ao)
+    ppg_s = ppg_sorted / float(fs_ref)
+    matched_ao_idx, matched_ppg_idx = _match_peaks_by_lag(
+        ao_sorted, ppg_sorted, fs_ao, fs_ref, tolerance_seconds
+    )
+    if len(matched_ao_idx) == 0:
+        return None
+
+    ptt_ms = (ppg_s[np.asarray(matched_ppg_idx)] - ao_s[np.asarray(matched_ao_idx)]) * 1000.0
+
+    ao_intervals_ms = np.diff(ao_s) * 1000.0
+    ao_interval_series = []
+    ptt_series = []
+    for ao_idx, ptt_value in zip(matched_ao_idx, ptt_ms):
+        if ao_idx == 0:
+            continue
+        ao_interval_series.append(ao_intervals_ms[ao_idx - 1])
+        ptt_series.append(ptt_value)
+
+    ptt_corr = (
+        np.corrcoef(ptt_series, ao_interval_series)[0, 1]
+        if len(ptt_series) > 1
+        else np.nan
+    )
+
+    return {
+        "mean_ptt_ms": float(np.mean(ptt_ms)),
+        "std_ptt_ms": float(np.std(ptt_ms)),
+        "ptt_rr_correlation": ptt_corr,
+    }
+
+
+def match_intervals_by_time(ao_peaks, ref_peaks, fs, apply_iqr=False):
     ao_peaks = np.asarray(ao_peaks, dtype=float)
     ref_peaks = np.asarray(ref_peaks, dtype=float)
 
     if len(ao_peaks) < 2 or len(ref_peaks) < 2:
-        return np.array([]), np.array([]), np.array([]), np.array([])
+        return (
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+        )
 
     ao_intervals_ms = np.diff(ao_peaks) / fs * 1000.0
     ref_intervals_ms = np.diff(ref_peaks) / fs * 1000.0
@@ -576,11 +723,25 @@ def match_intervals_by_time(ao_peaks, ref_peaks, fs):
     ref_centers_s = (ref_peaks[:-1] + ref_peaks[1:]) / 2.0 / fs
 
     if len(ao_centers_s) == 0 or len(ref_centers_s) == 0:
-        return np.array([]), np.array([]), np.array([]), np.array([])
+        return (
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+        )
 
     median_ref_seconds = np.median(ref_intervals_ms) / 1000.0
     if not np.isfinite(median_ref_seconds) or median_ref_seconds <= 0:
-        return np.array([]), np.array([]), np.array([]), np.array([])
+        return (
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+        )
 
     max_time_diff = 0.5 * median_ref_seconds
 
@@ -598,11 +759,38 @@ def match_intervals_by_time(ao_peaks, ref_peaks, fs):
             matched_ao_centers.append(ao_center)
             matched_ref_centers.append(ref_centers_s[nearest_idx])
 
+    matched_ao = np.asarray(matched_ao, dtype=float)
+    matched_ref = np.asarray(matched_ref, dtype=float)
+    matched_ao_centers = np.asarray(matched_ao_centers, dtype=float)
+    matched_ref_centers = np.asarray(matched_ref_centers, dtype=float)
+    if matched_ao.size == 0 or matched_ref.size == 0:
+        return (
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+            np.array([]),
+        )
+
+    removed_ao_centers = np.array([])
+    removed_ref_centers = np.array([])
+    if apply_iqr:
+        ao_mask = _iqr_inlier_mask(matched_ao)
+        ref_mask = _iqr_inlier_mask(matched_ref)
+        keep_mask = ao_mask & ref_mask
+        removed_ao_centers = matched_ao_centers[~keep_mask]
+        removed_ref_centers = matched_ref_centers[~keep_mask]
+    else:
+        keep_mask = np.ones(matched_ao.shape, dtype=bool)
+
     return (
-        np.asarray(matched_ao, dtype=float),
-        np.asarray(matched_ref, dtype=float),
-        np.asarray(matched_ao_centers, dtype=float),
-        np.asarray(matched_ref_centers, dtype=float),
+        matched_ao[keep_mask],
+        matched_ref[keep_mask],
+        matched_ao_centers[keep_mask],
+        matched_ref_centers[keep_mask],
+        removed_ao_centers,
+        removed_ref_centers,
     )
 
 
@@ -621,46 +809,58 @@ def compute_paper_metrics(ao_intervals_ms, ref_intervals_ms):
     aae = float(np.mean(np.abs(ao_hr - ref_hr)))
     aaep = float(np.mean(np.abs(ao_hr - ref_hr) / ref_hr) * 100.0)
 
+    diff_intervals = ao_intervals_ms - ref_intervals_ms
+    bias = float(np.mean(diff_intervals))
+    std_diff = float(np.std(diff_intervals))
+    loa_upper = bias + 1.96 * std_diff
+    loa_lower = bias - 1.96 * std_diff
+
     return {
         "ARE": are,
         "AAE": aae,
         "AAEP": aaep,
         "mean_scg_hr": mean_scg_hr,
         "mean_ref_hr": mean_ref_hr,
+        "ba_bias": bias,
+        "ba_upper_loa": loa_upper,
+        "ba_lower_loa": loa_lower,
     }
 
 
-def compute_detection_metrics(detected_peaks, reference_peaks, fs, tolerance_seconds=0.15):
+def compute_detection_metrics(detected_peaks, reference_peaks, fs_ao, fs_ref, tolerance_seconds=0.15):
     detected = np.asarray(detected_peaks, dtype=float)
     reference = np.asarray(reference_peaks, dtype=float)
-    tolerance_samples = float(tolerance_seconds) * fs
     if len(reference) == 0:
         return None
 
     detected = np.sort(detected)
     reference = np.sort(reference)
-    pep_min_samples = 0.05 * fs
-    pep_max_samples = 0.35 * fs
+    detected_s = detected / float(fs_ao)
+    reference_s = reference / float(fs_ref)
+    lag_seconds = _estimate_peak_lag_samples(detected, reference, fs_ao, fs_ref)
+    window_min, window_max = _ptt_window_samples(lag_seconds, tolerance_seconds)
 
-    used = np.zeros(len(detected), dtype=bool)
+    used = np.zeros(len(detected_s), dtype=bool)
+    matched_ref = np.zeros(len(reference_s), dtype=bool)
     tp = 0
-    fn = 0
 
-    for ref in reference:
+    for ref_idx, ref in enumerate(reference_s):
         candidates = np.where(
             (~used)
-            & (detected - ref >= pep_min_samples)
-            & (detected - ref <= pep_max_samples)
-            & (np.abs(detected - ref) <= tolerance_samples)
+            & (detected_s - ref >= window_min)
+            & (detected_s - ref <= window_max)
         )[0]
         if len(candidates) == 0:
-            fn += 1
             continue
-        closest_idx = candidates[np.argmin(np.abs(detected[candidates] - ref))]
+        closest_idx = candidates[np.argmin(np.abs(detected_s[candidates] - ref))]
         used[closest_idx] = True
+        matched_ref[ref_idx] = True
         tp += 1
 
     fp = int(np.sum(~used))
+    fn = int(np.sum(~matched_ref))
+    fp_peaks = detected[~used]
+    fn_peaks = reference[~matched_ref]
 
     se = tp / (tp + fn) * 100.0 if (tp + fn) > 0 else np.nan
     p = tp / (tp + fp) * 100.0 if (tp + fp) > 0 else np.nan
@@ -675,6 +875,10 @@ def compute_detection_metrics(detected_peaks, reference_peaks, fs, tolerance_sec
         "P": p,
         "ACC": acc,
         "DER": der,
+        "fp_peaks": fp_peaks,
+        "fn_peaks": fn_peaks,
+        "fp_times_s": fp_peaks / float(fs_ao),
+        "fn_times_s": fn_peaks / float(fs_ref),
     }
 
 
@@ -713,7 +917,11 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Preprocessing")
-    use_mti = st.checkbox("Apply Complete Preprocessing (MTI, Detrend, Median)", value=True)
+    preprocessing_mode = st.selectbox(
+        "Preprocessing",
+        ["MTI + Detrend + Median", "Bandpass 1-40 Hz", "None"],
+        index=0,
+    )
     target_fs = st.number_input("Processing sample rate (Hz)", min_value=50, max_value=1000, value=256, step=50)
 
     st.divider()
@@ -775,6 +983,14 @@ with st.sidebar:
     ppg_bp_high = st.number_input("PPG bandpass high (Hz)", min_value=1.0, max_value=20.0, value=8.0, step=0.5)
     ppg_max_bpm = st.number_input("Max BPM for peak distance", min_value=60.0, max_value=300.0, value=200.0, step=10.0)
     ppg_prom = st.number_input("PPG peak prominence factor", min_value=0.0, value=0.05, step=0.01)
+
+    st.divider()
+    st.subheader("Interval Metrics")
+    use_iqr_filter = st.checkbox(
+        "Apply IQR outlier filtering",
+        value=True,
+        help="Removes intervals outside 1.5x IQR for both AO and PPG series.",
+    )
 
     st.divider()
     st.subheader("Outputs")
@@ -865,8 +1081,10 @@ with window_col2:
 scg_raw = scg_df["z_g"].to_numpy(dtype=float)
 
 scg_proc_full, fs_proc = resample_for_processing(scg_raw, fs_infer, target_fs=target_fs)
-if use_mti:
+if preprocessing_mode == "MTI + Detrend + Median":
     scg_proc_full = apply_mti_filter(scg_proc_full)
+elif preprocessing_mode == "Bandpass 1-40 Hz":
+    scg_proc_full = apply_scg_bandpass(scg_proc_full, fs_proc, low_hz=1.0, high_hz=40.0)
 
 beat_times_s = beats_df["time_s"].to_numpy(dtype=float) if len(beats_df) > 0 else np.array([])
 
@@ -900,6 +1118,9 @@ if beat_source == "Detect from PPG raw" and not ppg_df.empty:
     ppg_peaks_idx = ppg_vis_peaks_idx
     if len(ppg_peaks_idx) > 0:
         beat_times_s = ppg_df["time_s"].to_numpy(dtype=float)[ppg_peaks_idx]
+
+ref_fs = float(ppg_vis_fs) if beat_source == "Detect from PPG raw" and ppg_vis_fs > 0 else 100.0
+ppg_peaks_ref = (beat_times_s * ref_fs).astype(int) if len(beat_times_s) > 0 else np.array([], dtype=int)
 
 ppg_peaks_full = (beat_times_s * fs_proc).astype(int)
 ppg_peaks_full = ppg_peaks_full[(ppg_peaks_full >= 0) & (ppg_peaks_full < len(scg_proc_full))]
@@ -956,11 +1177,32 @@ if run_window_btn:
 
         ppg_peaks_window = ppg_peaks_full[(ppg_peaks_full >= start_idx) & (ppg_peaks_full < end_idx)]
         ppg_peaks_window = ppg_peaks_window - start_idx
+        ppg_window_mask = (beat_times_s >= start_time) & (beat_times_s < start_time + window_size)
+        ppg_peaks_window_ref = ppg_peaks_ref[ppg_window_mask]
+        peaks_abs = peaks + start_idx
 
         comparison = None
+        detection_metrics_window = None
+        if len(peaks) > 0 and len(ppg_peaks_window_ref) > 0:
+            detection_metrics_window = compute_detection_metrics(
+                peaks_abs,
+                ppg_peaks_window_ref,
+                fs_proc,
+                ref_fs,
+            )
         if len(peaks) > 1 and len(ppg_peaks_window) > 1:
-            ao_intervals_ms, ppg_intervals_ms, ao_centers_s, ppg_centers_s = match_intervals_by_time(
-                peaks, ppg_peaks_window, fs_proc
+            (
+                ao_intervals_ms,
+                ppg_intervals_ms,
+                ao_centers_s,
+                ppg_centers_s,
+                iqr_removed_ao_centers_s,
+                iqr_removed_ppg_centers_s,
+            ) = match_intervals_by_time(
+                peaks,
+                ppg_peaks_window,
+                fs_proc,
+                apply_iqr=use_iqr_filter,
             )
             if len(ao_intervals_ms) > 0:
                 correlation = (
@@ -975,12 +1217,15 @@ if run_window_btn:
                 mean_diff = np.mean(diff_intervals)
                 std_diff = np.std(diff_intervals)
                 paper_metrics = compute_paper_metrics(ao_intervals_ms, ppg_intervals_ms)
+                ptt_metrics = compute_ptt_metrics(peaks_abs, ppg_peaks_window_ref, fs_proc, ref_fs)
 
                 comparison = {
                     "ao_intervals_ms": ao_intervals_ms,
                     "ppg_intervals_ms": ppg_intervals_ms,
                     "ao_centers_s": ao_centers_s,
                     "ppg_centers_s": ppg_centers_s,
+                    "iqr_removed_ao_centers_s": iqr_removed_ao_centers_s,
+                    "iqr_removed_ppg_centers_s": iqr_removed_ppg_centers_s,
                     "correlation": correlation,
                     "rmse": rmse,
                     "mae": mae,
@@ -989,6 +1234,7 @@ if run_window_btn:
                     "mean_intervals": mean_intervals,
                     "diff_intervals": diff_intervals,
                     "paper_metrics": paper_metrics,
+                    "ptt_metrics": ptt_metrics,
                 }
 
         time_axis = np.linspace(start_time, start_time + window_size, len(scg_window))
@@ -1010,6 +1256,25 @@ if run_window_btn:
         if len(ppg_peaks_window) > 0:
             for bt in time_axis[ppg_peaks_window]:
                 fig_overlay.add_vline(x=float(bt), line_width=1, line_dash="dash", line_color="green")
+
+        if detection_metrics_window:
+            fp_peaks = detection_metrics_window.get("fp_peaks", np.array([], dtype=int)).astype(int)
+            fn_times_s = detection_metrics_window.get("fn_times_s", np.array([], dtype=float))
+            fp_peaks = fp_peaks - start_idx
+            fp_peaks = fp_peaks[(fp_peaks >= 0) & (fp_peaks < len(scg_window))]
+            if len(fp_peaks) > 0:
+                fig_overlay.add_trace(
+                    go.Scatter(
+                        x=time_axis[fp_peaks],
+                        y=scg_window[fp_peaks],
+                        mode="markers",
+                        name="False Positives",
+                        marker=dict(color="#ff8c00", size=9, symbol="triangle-up"),
+                    )
+                )
+            if len(fn_times_s) > 0:
+                for bt in fn_times_s:
+                    fig_overlay.add_vline(x=float(bt), line_width=1, line_dash="dot", line_color="#6a5acd")
 
         fig_overlay.update_layout(
             title="Processed SCG with AO Peaks and PPG Beats",
@@ -1060,7 +1325,29 @@ if run_window_btn:
                 col8.metric("AAE (BPM)", f"{paper_metrics['AAE']:.2f}")
                 col9.metric("AAEP (%)", f"{paper_metrics['AAEP']:.2f}")
 
-            detection_metrics = compute_detection_metrics(peaks, ppg_peaks_window, fs_proc)
+            if use_iqr_filter:
+                removed_ao = comparison.get("iqr_removed_ao_centers_s", np.array([]))
+                removed_ppg = comparison.get("iqr_removed_ppg_centers_s", np.array([]))
+                if removed_ao.size > 0 or removed_ppg.size > 0:
+                    with st.expander("IQR-filtered intervals", expanded=False):
+                        st.write(
+                            f"Removed AO intervals: {len(removed_ao)} | "
+                            f"Removed PPG intervals: {len(removed_ppg)}"
+                        )
+                        if removed_ao.size > 0:
+                            st.dataframe(
+                                pd.DataFrame({"ao_interval_center_s": removed_ao + start_time}),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        if removed_ppg.size > 0:
+                            st.dataframe(
+                                pd.DataFrame({"ppg_interval_center_s": removed_ppg + start_time}),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+            detection_metrics = detection_metrics_window
             if detection_metrics:
                 col10, col11, col12, col13, col14, col15, col16 = st.columns(7)
                 col10.metric("TP", f"{detection_metrics['TP']}")
@@ -1070,6 +1357,35 @@ if run_window_btn:
                 col14.metric("P (%)", f"{detection_metrics['P']:.1f}")
                 col15.metric("ACC (%)", f"{detection_metrics['ACC']:.1f}")
                 col16.metric("DER (%)", f"{detection_metrics['DER']:.1f}")
+
+                with st.expander("Detection errors", expanded=False):
+                    fp_times = detection_metrics.get("fp_times_s", np.array([]))
+                    fn_times = detection_metrics.get("fn_times_s", np.array([]))
+                    fp_peaks = detection_metrics.get("fp_peaks", np.array([]))
+                    fn_peaks = detection_metrics.get("fn_peaks", np.array([]))
+                    st.write(f"False positives: {len(fp_times)} | False negatives: {len(fn_times)}")
+                    if len(fp_times) > 0:
+                        st.dataframe(
+                            pd.DataFrame(
+                                {
+                                    "fp_sample_idx": fp_peaks,
+                                    "fp_time_s": fp_times,
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    if len(fn_times) > 0:
+                        st.dataframe(
+                            pd.DataFrame(
+                                {
+                                    "fn_sample_idx": fn_peaks,
+                                    "fn_time_s": fn_times,
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
 
 st.divider()
@@ -1095,6 +1411,8 @@ if full_record_btn:
     
     ppg_peaks_full = ppg_peaks_full[(ppg_peaks_full >= start_idx_global) & (ppg_peaks_full < end_idx_global)]
     ppg_peaks_full = ppg_peaks_full - start_idx_global
+    ppg_ref_mask = (beat_times_s >= trim_start) & (beat_times_s < trim_end)
+    ppg_peaks_ref_trim = ppg_peaks_ref[ppg_ref_mask]
     
     analysis_duration = trim_end - trim_start
     st.info(f"Analyzing trimmed record ({analysis_duration:.1f}s) using 10-second windows...")
@@ -1104,7 +1422,8 @@ if full_record_btn:
     all_ao_intervals_times = []
 
     window_duration = 10.0
-    num_windows = int((len(scg_proc_full) / fs_proc) / window_duration)
+    total_duration = len(scg_proc_full) / fs_proc
+    num_windows = int(np.ceil(total_duration / window_duration))
 
     sqa_result_full_record = None
     sample_bad_mask_full_record = None
@@ -1144,7 +1463,7 @@ if full_record_btn:
 
     for i in range(num_windows):
         window_start = i * window_duration
-        window_end = window_start + window_duration
+        window_end = min(window_start + window_duration, total_duration)
 
         status_text.text(
             f"Processing window {i + 1}/{num_windows} ({window_start:.1f}s - {window_end:.1f}s)"
@@ -1153,6 +1472,8 @@ if full_record_btn:
 
         start_idx_w = int(window_start * fs_proc)
         end_idx_w = int(window_end * fs_proc)
+        if end_idx_w <= start_idx_w:
+            continue
 
         if sample_bad_mask_full_record is not None and exclude_bad_windows:
             bad_frac_window = float(np.mean(sample_bad_mask_full_record[start_idx_w:end_idx_w]))
@@ -1221,6 +1542,16 @@ if full_record_btn:
         if len(ppg_peaks_full) > 1
         else np.array([])
     )
+
+    detection_metrics_full = None
+    if len(all_ao_peaks) > 0 and len(ppg_peaks_ref_trim) > 0:
+        all_ao_peaks_abs = all_ao_peaks + start_idx_global
+        detection_metrics_full = compute_detection_metrics(
+            all_ao_peaks_abs,
+            ppg_peaks_ref_trim,
+            fs_proc,
+            ref_fs,
+        )
 
     has_ppg_vis = ppg_vis_filtered is not None and not ppg_df.empty
     st.subheader("Signals and Interval Time Series")
@@ -1341,6 +1672,34 @@ if full_record_btn:
             col=1,
         )
 
+    if detection_metrics_full:
+        fp_peaks = detection_metrics_full.get("fp_peaks", np.array([], dtype=int)).astype(int)
+        fn_times_s = detection_metrics_full.get("fn_times_s", np.array([], dtype=float))
+        fp_peaks = fp_peaks - start_idx_global
+        fp_peaks = fp_peaks[(fp_peaks >= 0) & (fp_peaks < len(scg_proc_full))]
+        if len(fp_peaks) > 0:
+            fig_intervals.add_trace(
+                go.Scatter(
+                    x=full_time_axis[fp_peaks],
+                    y=scg_proc_full[fp_peaks],
+                    mode="markers",
+                    marker=dict(color="#ff8c00", size=6, symbol="triangle-up"),
+                    name="False Positives",
+                ),
+                row=2,
+                col=1,
+            )
+        if len(fn_times_s) > 0:
+            for bt in fn_times_s:
+                fig_intervals.add_vline(
+                    x=float(bt),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="#6a5acd",
+                    row=2,
+                    col=1,
+                )
+
     intervals_row = 3
     if has_ppg_vis:
         ppg_time_full = ppg_df["time_s"].to_numpy(dtype=float)
@@ -1423,8 +1782,18 @@ if full_record_btn:
     st.plotly_chart(fig_intervals, use_container_width=True)
 
     if len(all_ao_peaks) > 1 and len(ppg_peaks_full) > 1:
-        ao_intervals_matched, ppg_intervals_matched, ao_centers_s, ppg_centers_s = match_intervals_by_time(
-            all_ao_peaks, ppg_peaks_full, fs_proc
+        (
+            ao_intervals_matched,
+            ppg_intervals_matched,
+            ao_centers_s,
+            ppg_centers_s,
+            iqr_removed_ao_centers_s,
+            iqr_removed_ppg_centers_s,
+        ) = match_intervals_by_time(
+            all_ao_peaks,
+            ppg_peaks_full,
+            fs_proc,
+            apply_iqr=use_iqr_filter,
         )
 
         if sample_bad_mask_full_record is not None and show_sqa_overlay:
@@ -1458,6 +1827,8 @@ if full_record_btn:
             mean_diff = np.mean(diff_intervals)
             std_diff = np.std(diff_intervals)
             paper_metrics = compute_paper_metrics(ao_intervals_matched, ppg_intervals_matched)
+            all_ao_peaks_abs = all_ao_peaks + start_idx_global
+            ptt_metrics = compute_ptt_metrics(all_ao_peaks_abs, ppg_peaks_ref_trim, fs_proc, ref_fs)
 
             st.subheader("Full Record Interval Comparison")
             col1, col2, col3, col4 = st.columns(4)
@@ -1474,7 +1845,38 @@ if full_record_btn:
                 col8.metric("AAE (BPM)", f"{paper_metrics['AAE']:.2f}")
                 col9.metric("AAEP (%)", f"{paper_metrics['AAEP']:.2f}")
 
-            detection_metrics = compute_detection_metrics(all_ao_peaks, ppg_peaks_full, fs_proc)
+                col10, col11, col12 = st.columns(3)
+                col10.metric("BA Bias (ms)", f"{paper_metrics['ba_bias']:.1f}")
+                col11.metric("BA Upper LOA (ms)", f"{paper_metrics['ba_upper_loa']:.1f}")
+                col12.metric("BA Lower LOA (ms)", f"{paper_metrics['ba_lower_loa']:.1f}")
+
+            if use_iqr_filter:
+                if iqr_removed_ao_centers_s.size > 0 or iqr_removed_ppg_centers_s.size > 0:
+                    with st.expander("IQR-filtered intervals", expanded=False):
+                        st.write(
+                            f"Removed AO intervals: {len(iqr_removed_ao_centers_s)} | "
+                            f"Removed PPG intervals: {len(iqr_removed_ppg_centers_s)}"
+                        )
+                        if iqr_removed_ao_centers_s.size > 0:
+                            st.dataframe(
+                                pd.DataFrame({"ao_interval_center_s": iqr_removed_ao_centers_s + trim_start}),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+                        if iqr_removed_ppg_centers_s.size > 0:
+                            st.dataframe(
+                                pd.DataFrame({"ppg_interval_center_s": iqr_removed_ppg_centers_s + trim_start}),
+                                use_container_width=True,
+                                hide_index=True,
+                            )
+
+            if ptt_metrics:
+                col13, col14, col15 = st.columns(3)
+                col13.metric("Mean PTT (ms)", f"{ptt_metrics['mean_ptt_ms']:.1f}")
+                col14.metric("PTT SD (ms)", f"{ptt_metrics['std_ptt_ms']:.1f}")
+                col15.metric("PTT vs AO Corr", f"{ptt_metrics['ptt_rr_correlation']:.3f}")
+
+            detection_metrics = detection_metrics_full
             if detection_metrics:
                 col10, col11, col12, col13, col14, col15, col16 = st.columns(7)
                 col10.metric("TP", f"{detection_metrics['TP']}")
@@ -1484,6 +1886,35 @@ if full_record_btn:
                 col14.metric("P (%)", f"{detection_metrics['P']:.1f}")
                 col15.metric("ACC (%)", f"{detection_metrics['ACC']:.1f}")
                 col16.metric("DER (%)", f"{detection_metrics['DER']:.1f}")
+
+                with st.expander("Detection errors", expanded=False):
+                    fp_times = detection_metrics.get("fp_times_s", np.array([]))
+                    fn_times = detection_metrics.get("fn_times_s", np.array([]))
+                    fp_peaks = detection_metrics.get("fp_peaks", np.array([]))
+                    fn_peaks = detection_metrics.get("fn_peaks", np.array([]))
+                    st.write(f"False positives: {len(fp_times)} | False negatives: {len(fn_times)}")
+                    if len(fp_times) > 0:
+                        st.dataframe(
+                            pd.DataFrame(
+                                {
+                                    "fp_sample_idx": fp_peaks,
+                                    "fp_time_s": fp_times,
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    if len(fn_times) > 0:
+                        st.dataframe(
+                            pd.DataFrame(
+                                {
+                                    "fn_sample_idx": fn_peaks,
+                                    "fn_time_s": fn_times,
+                                }
+                            ),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
 
             fig_ba = go.Figure()
             fig_ba.add_trace(
