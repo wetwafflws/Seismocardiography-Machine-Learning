@@ -43,6 +43,7 @@ class HVDNetDataLoader:
     def __init__(self, data_dir="Data"):
         self.data_dir = data_dir
         self.saved_peaks_dir = "Saved_Peaks"
+        self.subject_data_dir = "SUBJECT_Data"
         self.target_fs = 256
         self.label_columns = [
             "Moderate or greater MS",
@@ -84,6 +85,92 @@ class HVDNetDataLoader:
     def time_to_seconds(self, time_str):
         h, m, s = time_str.split(":")
         return int(h) * 3600 + int(m) * 60 + float(s)
+
+    def _list_subject_csv_paths(self):
+        pattern = os.path.join(self.subject_data_dir, "**", "*.csv")
+        return sorted(glob.glob(pattern, recursive=True))
+
+    def _find_subject_csv_path(self, patient_id):
+        for path in self._list_subject_csv_paths():
+            if os.path.splitext(os.path.basename(path))[0] == patient_id:
+                return path
+        return None
+
+    def load_subject_metadata(self, csv_path):
+        meta_path = os.path.splitext(csv_path)[0] + "_meta.json"
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        meta = {}
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.startswith("#"):
+                        break
+                    stripped = line.lstrip("#").strip()
+                    if not stripped:
+                        continue
+                    if "," in stripped:
+                        key, value = stripped.split(",", 1)
+                        meta[key.strip()] = value.strip()
+        except FileNotFoundError:
+            return meta
+
+        for key in ("age", "sample_rate_scg_hz", "sample_rate_ppg_hz"):
+            if key in meta:
+                try:
+                    meta[key] = int(float(meta[key]))
+                except ValueError:
+                    pass
+        for key in ("weight_kg", "height_cm", "bmi"):
+            if key in meta:
+                try:
+                    meta[key] = float(meta[key])
+                except ValueError:
+                    pass
+
+        conditions = meta.get("cardiac_conditions")
+        if isinstance(conditions, str):
+            parts = [p.strip() for p in conditions.replace("|", ";").split(";")]
+            expanded = []
+            for part in parts:
+                if "," in part:
+                    expanded.extend([p.strip() for p in part.split(",")])
+                elif part:
+                    expanded.append(part)
+            meta["cardiac_conditions"] = [p for p in expanded if p]
+
+        return meta
+
+    def build_label_row_from_metadata(self, patient_id, meta):
+        label_row = {"Patient ID": patient_id}
+        for label_name in self.label_columns:
+            label_row[label_name] = 0
+
+        conditions = meta.get("cardiac_conditions") or []
+        if isinstance(conditions, str):
+            conditions = [conditions]
+
+        for condition in conditions:
+            if condition is None:
+                continue
+            normalized = str(condition).strip()
+            if not normalized or normalized.lower() == "normal":
+                continue
+            tokens = set(normalized.upper().replace("-", " ").replace("/", " ").split())
+            if "MS" in tokens or ("MITRAL" in tokens and "STENOSIS" in tokens):
+                label_row["Moderate or greater MS"] = 1
+            if "MR" in tokens or ("MITRAL" in tokens and "REGURGITATION" in tokens):
+                label_row["Moderate or greater MR"] = 1
+            if "AR" in tokens or ("AORTIC" in tokens and "REGURGITATION" in tokens):
+                label_row["Moderate or greater AR"] = 1
+            if "AS" in tokens or ("AORTIC" in tokens and "STENOSIS" in tokens):
+                label_row["Moderate or greater AS"] = 1
+            if "TR" in tokens or ("TRICUSPID" in tokens and "REGURGITATION" in tokens):
+                label_row["Moderate or greater TR"] = 1
+
+        return label_row
 
     def get_task_class_names(self, task_name):
         if task_name not in self.task_class_names:
@@ -183,17 +270,31 @@ class HVDNetDataLoader:
         }
 
     def load_labels_table(self):
+        label_lookup = {}
         labels_path = self._resolve_existing_path(self.data_dir, "ground_truth_labels.csv")
-        if not os.path.exists(labels_path):
-            return {}
+        if os.path.exists(labels_path):
+            df_labels = pd.read_csv(labels_path, sep=",")
+            df_labels.columns = df_labels.columns.str.strip()
+            label_lookup = {row["Patient ID"]: row.to_dict() for _, row in df_labels.iterrows()}
 
-        df_labels = pd.read_csv(labels_path, sep=",")
-        df_labels.columns = df_labels.columns.str.strip()
-        return {row["Patient ID"]: row.to_dict() for _, row in df_labels.iterrows()}
+        for csv_path in self._list_subject_csv_paths():
+            patient_id = os.path.splitext(os.path.basename(csv_path))[0]
+            meta = self.load_subject_metadata(csv_path)
+            label_lookup[patient_id] = self.build_label_row_from_metadata(patient_id, meta)
+
+        return label_lookup
 
     def list_available_patients(self):
         csv_paths = sorted(glob.glob(os.path.join(self.data_dir, "Cleaned_*.csv")))
-        return [os.path.basename(path).replace("Cleaned_", "").replace(".csv", "") for path in csv_paths]
+        cleaned_ids = [
+            os.path.basename(path).replace("Cleaned_", "").replace(".csv", "")
+            for path in csv_paths
+        ]
+        subject_ids = [
+            os.path.splitext(os.path.basename(path))[0]
+            for path in self._list_subject_csv_paths()
+        ]
+        return sorted(set(cleaned_ids + subject_ids))
 
     def list_eligible_patients_for_task(self, task_name):
         label_lookup = self.load_labels_table()
@@ -212,27 +313,55 @@ class HVDNetDataLoader:
         results = {}
 
         csv_path = self._resolve_existing_path(self.data_dir, "Cleaned_{}.csv".format(patient_id))
-        if not os.path.exists(csv_path):
-            raise FileNotFoundError("Missing patient CSV: {}".format(csv_path))
+        if os.path.exists(csv_path):
+            df_signals = pd.read_csv(csv_path, sep=r",")
+            original_fs = self.get_original_fs(patient_id)
 
-        df_signals = pd.read_csv(csv_path, sep=r",")
-        original_fs = self.get_original_fs(patient_id)
+            scg_x = df_signals["AccX"].values
+            scg_y = df_signals["AccY"].values
+            scg_z = df_signals["AccZ"].values
+            ecg = df_signals["ECG"].values
 
-        scg_x = df_signals["AccX"].values
-        scg_y = df_signals["AccY"].values
-        scg_z = df_signals["AccZ"].values
-        ecg = df_signals["ECG"].values
+            if original_fs == 512:
+                new_len = len(scg_x) // 2
+                scg_x = signal.resample(scg_x, new_len)
+                scg_y = signal.resample(scg_y, new_len)
+                scg_z = signal.resample(scg_z, new_len)
+                ecg = signal.resample(ecg, new_len)
 
-        if original_fs == 512:
-            new_len = len(scg_x) // 2
-            scg_x = signal.resample(scg_x, new_len)
-            scg_y = signal.resample(scg_y, new_len)
-            scg_z = signal.resample(scg_z, new_len)
-            ecg = signal.resample(ecg, new_len)
+            results["signals"] = {"AccX": scg_x, "AccY": scg_y, "AccZ": scg_z, "ECG": ecg}
+            results["fs"] = self.target_fs
+            results["signal_length"] = len(scg_x)
+        else:
+            subject_csv = self._find_subject_csv_path(patient_id)
+            if subject_csv is None:
+                raise FileNotFoundError("Missing patient CSV: {}".format(csv_path))
 
-        results["signals"] = {"AccX": scg_x, "AccY": scg_y, "AccZ": scg_z, "ECG": ecg}
-        results["fs"] = self.target_fs
-        results["signal_length"] = len(scg_x)
+            df_signals = pd.read_csv(subject_csv, comment="#")
+            meta = self.load_subject_metadata(subject_csv)
+            original_fs = int(meta.get("sample_rate_scg_hz", self.target_fs))
+
+            scg_mask = df_signals["x_g"].notna()
+            scg_x = df_signals.loc[scg_mask, "x_g"].to_numpy(dtype=np.float32)
+            scg_y = df_signals.loc[scg_mask, "y_g"].to_numpy(dtype=np.float32)
+            scg_z = df_signals.loc[scg_mask, "z_g"].to_numpy(dtype=np.float32)
+
+            if scg_x.size == 0:
+                raise ValueError("No SCG samples found in subject CSV")
+
+            ecg = np.zeros_like(scg_x, dtype=np.float32)
+
+            if original_fs != self.target_fs:
+                new_len = int(round(len(scg_x) * self.target_fs / float(original_fs)))
+                scg_x = signal.resample(scg_x, new_len)
+                scg_y = signal.resample(scg_y, new_len)
+                scg_z = signal.resample(scg_z, new_len)
+                ecg = signal.resample(ecg, new_len)
+
+            results["signals"] = {"AccX": scg_x, "AccY": scg_y, "AccZ": scg_z, "ECG": ecg}
+            results["fs"] = self.target_fs
+            results["signal_length"] = len(scg_x)
+            results["metadata"] = meta
 
         peak_info = self.load_annotation_peaks(patient_id, annotation_source, results["signal_length"])
         results["r_peaks_indices"] = peak_info["peak_indices"]

@@ -42,6 +42,7 @@ class HVDNetDataLoader:
     def __init__(self, data_dir="Data"):
         self.data_dir = data_dir
         self.saved_peaks_dir = "Saved_Peaks"
+        self.subject_data_dir = "SUBJECT_Data"
         self.target_fs = 256  # The paper standardizes to 256 Hz 
         self.label_columns = [
             "Moderate or greater MS",
@@ -74,6 +75,119 @@ class HVDNetDataLoader:
         """Converts HH:MM:SS.ssss to total seconds."""
         h, m, s = time_str.split(':')
         return int(h) * 3600 + int(m) * 60 + float(s)
+
+    def _list_subject_csv_paths(self):
+        pattern = os.path.join(self.subject_data_dir, "**", "*.csv")
+        return sorted(glob.glob(pattern, recursive=True))
+
+    def _find_subject_csv_path(self, patient_id):
+        for path in self._list_subject_csv_paths():
+            if os.path.splitext(os.path.basename(path))[0] == patient_id:
+                return path
+        return None
+
+    def load_subject_metadata(self, csv_path):
+        meta_path = os.path.splitext(csv_path)[0] + "_meta.json"
+        if os.path.exists(meta_path):
+            with open(meta_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+
+        meta = {}
+        try:
+            with open(csv_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if not line.startswith("#"):
+                        break
+                    stripped = line.lstrip("#").strip()
+                    if not stripped:
+                        continue
+                    if "," in stripped:
+                        key, value = stripped.split(",", 1)
+                        meta[key.strip()] = value.strip()
+        except FileNotFoundError:
+            return meta
+
+        for key in ("age", "sample_rate_scg_hz", "sample_rate_ppg_hz"):
+            if key in meta:
+                try:
+                    meta[key] = int(float(meta[key]))
+                except ValueError:
+                    pass
+        for key in ("weight_kg", "height_cm", "bmi"):
+            if key in meta:
+                try:
+                    meta[key] = float(meta[key])
+                except ValueError:
+                    pass
+
+        conditions = meta.get("cardiac_conditions")
+        if isinstance(conditions, str):
+            parts = [p.strip() for p in conditions.replace("|", ";").split(";")]
+            expanded = []
+            for part in parts:
+                if "," in part:
+                    expanded.extend([p.strip() for p in part.split(",")])
+                elif part:
+                    expanded.append(part)
+            meta["cardiac_conditions"] = [p for p in expanded if p]
+
+        return meta
+
+    def build_label_row_from_metadata(self, patient_id, meta):
+        label_row = {"Patient ID": patient_id}
+        for label_name in self.label_columns:
+            label_row[label_name] = 0
+
+        conditions = meta.get("cardiac_conditions") or []
+        if isinstance(conditions, str):
+            conditions = [conditions]
+
+        for condition in conditions:
+            if condition is None:
+                continue
+            normalized = str(condition).strip()
+            if not normalized or normalized.lower() == "normal":
+                continue
+            tokens = set(normalized.upper().replace("-", " ").replace("/", " ").split())
+            if "MS" in tokens or ("MITRAL" in tokens and "STENOSIS" in tokens):
+                label_row["Moderate or greater MS"] = 1
+            if "MR" in tokens or ("MITRAL" in tokens and "REGURGITATION" in tokens):
+                label_row["Moderate or greater MR"] = 1
+            if "AR" in tokens or ("AORTIC" in tokens and "REGURGITATION" in tokens):
+                label_row["Moderate or greater AR"] = 1
+            if "AS" in tokens or ("AORTIC" in tokens and "STENOSIS" in tokens):
+                label_row["Moderate or greater AS"] = 1
+            if "TR" in tokens or ("TRICUSPID" in tokens and "REGURGITATION" in tokens):
+                label_row["Moderate or greater TR"] = 1
+
+        return label_row
+
+    def load_labels_table(self):
+        label_lookup = {}
+        labels_path = os.path.join(self.data_dir, "ground_truth_labels.csv")
+        if os.path.exists(labels_path):
+            df_labels = pd.read_csv(labels_path, sep=",")
+            df_labels.columns = df_labels.columns.str.strip()
+            label_lookup = {row["Patient ID"]: row.to_dict() for _, row in df_labels.iterrows()}
+
+        for csv_path in self._list_subject_csv_paths():
+            patient_id = os.path.splitext(os.path.basename(csv_path))[0]
+            meta = self.load_subject_metadata(csv_path)
+            label_lookup[patient_id] = self.build_label_row_from_metadata(patient_id, meta)
+
+        return label_lookup
+
+    def list_available_patients(self):
+        cleaned_paths = sorted(glob.glob(os.path.join(self.data_dir, "Cleaned_*.csv")))
+        cleaned_ids = [
+            os.path.basename(path).replace("Cleaned_", "").replace(".csv", "")
+            for path in cleaned_paths
+        ]
+        subject_ids = [
+            os.path.splitext(os.path.basename(path))[0]
+            for path in self._list_subject_csv_paths()
+        ]
+        return sorted(set(cleaned_ids + subject_ids))
 
     def load_annotation_peaks(self, patient_id, annotation_source, signal_length):
         annotation_source = (annotation_source or "ECG").upper()
@@ -117,38 +231,74 @@ class HVDNetDataLoader:
         """Loads SCG, ECG, selected peaks annotation, and Ground Truth for a given patient."""
         results = {}
         
-        # 1. Load Raw Signals (CSV)
-        # Using \s+ as separator since Excel copy-paste usually yields tabs or multiple spaces
-        csv_path = f"{self.data_dir}Cleaned_{patient_id}.csv"
-        try:
-            df_signals = pd.read_csv(csv_path, sep=r',')
-            original_fs = self.get_original_fs(patient_id)
-            
-            scg_x = df_signals['AccX'].values
-            scg_y = df_signals['AccY'].values
-            scg_z = df_signals['AccZ'].values
-            ecg = df_signals['ECG'].values
+        cleaned_path = os.path.join(self.data_dir, f"Cleaned_{patient_id}.csv")
+        if not os.path.exists(cleaned_path):
+            cleaned_path = f"{self.data_dir}Cleaned_{patient_id}.csv"
 
-            # Resample to 256 Hz if necessary 
-            if original_fs == 512:
-                # Calculate new length for 256 Hz (exactly half)
-                new_len = len(scg_x) // 2
-                scg_x = signal.resample(scg_x, new_len)
-                scg_y = signal.resample(scg_y, new_len)
-                scg_z = signal.resample(scg_z, new_len)
-                ecg = signal.resample(ecg, new_len)
-                
-            results['signals'] = {
-                'AccX': scg_x,
-                'AccY': scg_y,
-                'AccZ': scg_z,
-                'ECG': ecg
-            }
-            results['fs'] = self.target_fs
-            results['signal_length'] = len(scg_x)
-            
-        except Exception as e:
-            raise Exception(f"Failed to load signal CSV: {str(e)}")
+        if os.path.exists(cleaned_path):
+            try:
+                df_signals = pd.read_csv(cleaned_path, sep=r',')
+                original_fs = self.get_original_fs(patient_id)
+
+                scg_x = df_signals['AccX'].values
+                scg_y = df_signals['AccY'].values
+                scg_z = df_signals['AccZ'].values
+                ecg = df_signals['ECG'].values
+
+                if original_fs == 512:
+                    new_len = len(scg_x) // 2
+                    scg_x = signal.resample(scg_x, new_len)
+                    scg_y = signal.resample(scg_y, new_len)
+                    scg_z = signal.resample(scg_z, new_len)
+                    ecg = signal.resample(ecg, new_len)
+
+                results['signals'] = {
+                    'AccX': scg_x,
+                    'AccY': scg_y,
+                    'AccZ': scg_z,
+                    'ECG': ecg
+                }
+                results['fs'] = self.target_fs
+                results['signal_length'] = len(scg_x)
+            except Exception as e:
+                raise Exception(f"Failed to load signal CSV: {str(e)}")
+        else:
+            subject_csv = self._find_subject_csv_path(patient_id)
+            if subject_csv is None:
+                raise FileNotFoundError(f"Missing patient CSV for {patient_id}")
+            try:
+                df_signals = pd.read_csv(subject_csv, comment="#")
+                meta = self.load_subject_metadata(subject_csv)
+                original_fs = int(meta.get("sample_rate_scg_hz", self.target_fs))
+
+                scg_mask = df_signals["x_g"].notna()
+                scg_x = df_signals.loc[scg_mask, "x_g"].to_numpy(dtype=np.float32)
+                scg_y = df_signals.loc[scg_mask, "y_g"].to_numpy(dtype=np.float32)
+                scg_z = df_signals.loc[scg_mask, "z_g"].to_numpy(dtype=np.float32)
+
+                if scg_x.size == 0:
+                    raise ValueError("No SCG samples found in subject CSV")
+
+                ecg = np.zeros_like(scg_x, dtype=np.float32)
+
+                if original_fs != self.target_fs:
+                    new_len = int(round(len(scg_x) * self.target_fs / float(original_fs)))
+                    scg_x = signal.resample(scg_x, new_len)
+                    scg_y = signal.resample(scg_y, new_len)
+                    scg_z = signal.resample(scg_z, new_len)
+                    ecg = signal.resample(ecg, new_len)
+
+                results['signals'] = {
+                    'AccX': scg_x,
+                    'AccY': scg_y,
+                    'AccZ': scg_z,
+                    'ECG': ecg
+                }
+                results['fs'] = self.target_fs
+                results['signal_length'] = len(scg_x)
+                results['metadata'] = meta
+            except Exception as e:
+                raise Exception(f"Failed to load subject CSV: {str(e)}")
 
         # 2. Load selected annotation peaks (ECG R-peaks or AO peaks)
         peak_info = self.load_annotation_peaks(patient_id, annotation_source, results['signal_length'])
@@ -158,18 +308,10 @@ class HVDNetDataLoader:
         results['peak_label'] = peak_info['peak_label']
 
         # 3. Load Ground Truth Labels
-        labels_path = f"{self.data_dir}ground_truth_labels.csv"
         try:
-            # Assuming tab separated if copied from excel. Adjust sep if it's comma-separated.
-            df_labels = pd.read_csv(labels_path, sep=',') 
-            
-            # Standardize column names to remove leading/trailing whitespaces
-            df_labels.columns = df_labels.columns.str.strip()
-            
-            patient_row = df_labels[df_labels['Patient ID'] == patient_id]
-            if not patient_row.empty:
-                label_row = patient_row.iloc[0]
-                label_dict = label_row.to_dict()
+            label_lookup = self.load_labels_table()
+            label_dict = label_lookup.get(patient_id)
+            if isinstance(label_dict, dict):
                 positive_labels = [
                     label_name for label_name in self.label_columns
                     if int(label_dict.get(label_name, 0)) == 1
@@ -186,7 +328,6 @@ class HVDNetDataLoader:
                 results['label_vector'] = None
                 results['label_index'] = None
                 results['label_name'] = None
-                
         except Exception as e:
             raise Exception(f"Failed to load Ground Truth Labels: {str(e)}")
 
@@ -1411,17 +1552,8 @@ class HVDMainWindow(QMainWindow):
 
         task_name = task_name or self.task_selector.currentText()
 
-        csv_paths = sorted(glob.glob(os.path.join(self.loader.data_dir, "Cleaned_*.csv")))
-        labels_path = os.path.join(self.loader.data_dir, "ground_truth_labels.csv")
-        label_lookup = {}
-
-        if os.path.exists(labels_path):
-            df_labels = pd.read_csv(labels_path, sep=',')
-            df_labels.columns = df_labels.columns.str.strip()
-            label_lookup = {
-                row['Patient ID']: row.to_dict()
-                for _, row in df_labels.iterrows()
-            }
+        patient_ids = self.loader.list_available_patients()
+        label_lookup = self.loader.load_labels_table()
 
         current_patient_id = self.current_patient_id
         current_model_data = self.patient_input.currentData() if self.patient_input.count() > 0 else None
@@ -1429,8 +1561,7 @@ class HVDMainWindow(QMainWindow):
         self.patient_input.blockSignals(True)
         self.patient_input.clear()
 
-        for csv_path in csv_paths:
-            patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
+        for patient_id in patient_ids:
             label_row = label_lookup.get(patient_id)
             if task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II") and not self.is_patient_eligible_for_task(label_row, task_name):
                 continue
@@ -1476,26 +1607,13 @@ class HVDMainWindow(QMainWindow):
         if self.dataset_class_summary_cache is not None:
             return self.dataset_class_summary_cache
 
-        csv_paths = sorted(glob.glob(os.path.join(self.loader.data_dir, "Cleaned_*.csv")))
-        available_patient_ids = {
-            os.path.basename(path).replace("Cleaned_", "").replace(".csv", "")
-            for path in csv_paths
-        }
-
-        labels_path = os.path.join(self.loader.data_dir, "ground_truth_labels.csv")
-        df_labels = pd.read_csv(labels_path, sep=',')
-        df_labels.columns = df_labels.columns.str.strip()
-        df_labels = df_labels[df_labels['Patient ID'].isin(available_patient_ids)]
-
-        label_rows = {
-            row['Patient ID']: row.to_dict()
-            for _, row in df_labels.iterrows()
-        }
+        available_patient_ids = set(self.loader.list_available_patients())
+        label_rows = self.loader.load_labels_table()
 
         summary = {
             'total_cleaned_files': len(available_patient_ids),
-            'labeled_patients': len(label_rows),
-            'missing_label_rows': int(len(available_patient_ids) - len(label_rows)),
+            'labeled_patients': len([pid for pid in available_patient_ids if pid in label_rows]),
+            'missing_label_rows': int(len(available_patient_ids) - len([pid for pid in available_patient_ids if pid in label_rows])),
             'tasks': {}
         }
 
@@ -2142,8 +2260,8 @@ class HVDMainWindow(QMainWindow):
     def build_training_dataset(self, task_name, balance_classes=True):
         class_names = self.loader.get_task_class_names(task_name)
 
-        csv_paths = sorted(glob.glob(os.path.join(self.loader.data_dir, "Cleaned_*.csv")))
-        if not csv_paths:
+        patient_ids = self.loader.list_available_patients()
+        if not patient_ids:
             raise RuntimeError(f"No training CSV files found in {self.loader.data_dir}")
 
         x_samples = []
@@ -2160,24 +2278,16 @@ class HVDMainWindow(QMainWindow):
         balanced_patient_ids = None
         balance_max_per_class = None
         if balance_classes and task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II"):
-            labels_path = os.path.join(self.loader.data_dir, "ground_truth_labels.csv")
-            if os.path.exists(labels_path):
-                df_labels = pd.read_csv(labels_path, sep=',')
-                df_labels.columns = df_labels.columns.str.strip()
-                label_rows = {
-                    row['Patient ID']: row.to_dict()
-                    for _, row in df_labels.iterrows()
-                }
-                class_to_patients = {idx: [] for idx in range(len(class_names))}
-                for csv_path in csv_paths:
-                    patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
-                    label_row = label_rows.get(patient_id)
-                    if label_row is None:
-                        continue
-                    class_index = self.loader.map_label_row_to_task_index(label_row, task_name)
-                    if class_index is None:
-                        continue
-                    class_to_patients[int(class_index)].append(patient_id)
+            label_rows = self.loader.load_labels_table()
+            class_to_patients = {idx: [] for idx in range(len(class_names))}
+            for patient_id in patient_ids:
+                label_row = label_rows.get(patient_id)
+                if label_row is None:
+                    continue
+                class_index = self.loader.map_label_row_to_task_index(label_row, task_name)
+                if class_index is None:
+                    continue
+                class_to_patients[int(class_index)].append(patient_id)
 
                 present_counts = [len(patients) for patients in class_to_patients.values() if patients]
                 if present_counts:
@@ -2193,8 +2303,7 @@ class HVDMainWindow(QMainWindow):
                             selected.update(chosen.tolist())
                     balanced_patient_ids = selected
 
-        for csv_path in csv_paths:
-            patient_id = os.path.basename(csv_path).replace("Cleaned_", "").replace(".csv", "")
+        for patient_id in patient_ids:
             if balanced_patient_ids is not None and patient_id not in balanced_patient_ids:
                 skipped_by_balance += 1
                 continue
