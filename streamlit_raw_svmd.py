@@ -121,16 +121,46 @@ def format_timestamp(seconds_val: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:07.4f}"
 
 
-def save_peaks_to_json(peaks_indices, fs, record_name, output_dir="Saved_Peaks") -> str:
-    os.makedirs(output_dir, exist_ok=True)
-    timestamps = [format_timestamp(p / fs) for p in peaks_indices]
-    data = {f"{record_name}_AO_Peaks": timestamps}
+def _build_peaks_payload(peak_seconds, record_name: str, peak_label: str) -> dict:
+    timestamps = [format_timestamp(float(sec)) for sec in peak_seconds]
+    return {f"{record_name}_{peak_label}_Peaks": timestamps}
 
-    out_path = os.path.join(output_dir, f"{record_name}_AO_Peaks.json")
+
+def save_peaks_to_json(peaks_indices, fs, record_name, output_dir="Saved_Peaks", peak_label="AO") -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    fs_safe = float(fs) if fs else 0.0
+    peak_seconds = np.asarray(peaks_indices, dtype=float) / fs_safe if fs_safe > 0 else []
+    data = _build_peaks_payload(peak_seconds, record_name, peak_label)
+
+    out_path = os.path.join(output_dir, f"{record_name}_{peak_label}_Peaks.json")
     with open(out_path, "w") as f:
         json.dump(data, f, indent=4)
 
     return out_path
+
+
+def save_peaks_seconds_to_json(peak_seconds, record_name, output_dir="Saved_Peaks", peak_label="AO") -> str:
+    os.makedirs(output_dir, exist_ok=True)
+    data = _build_peaks_payload(peak_seconds, record_name, peak_label)
+
+    out_path = os.path.join(output_dir, f"{record_name}_{peak_label}_Peaks.json")
+    with open(out_path, "w") as f:
+        json.dump(data, f, indent=4)
+
+    return out_path
+
+
+def _map_times_to_indices(time_axis_s: np.ndarray, event_times_s: np.ndarray) -> np.ndarray:
+    if len(time_axis_s) == 0 or len(event_times_s) == 0:
+        return np.array([], dtype=int)
+    idx = np.searchsorted(time_axis_s, event_times_s)
+    idx = np.clip(idx, 1, len(time_axis_s) - 1)
+    prev_idx = idx - 1
+    next_idx = idx
+    prev_dt = np.abs(time_axis_s[prev_idx] - event_times_s)
+    next_dt = np.abs(time_axis_s[next_idx] - event_times_s)
+    chosen = np.where(next_dt < prev_dt, next_idx, prev_idx)
+    return chosen.astype(int)
 
 
 def resample_for_processing(raw_signal, fs_original, target_fs=500):
@@ -995,6 +1025,12 @@ with st.sidebar:
     st.divider()
     st.subheader("Outputs")
     save_json_output = st.checkbox("Save AO Peaks to JSON", value=False)
+    save_ppg_json_output = st.checkbox(
+        "Save PPG Peaks to JSON",
+        value=False,
+        disabled=beat_source != "Detect from PPG raw",
+        help="Available when raw PPG peaks are detected from the PPG signal.",
+    )
     output_folder = st.text_input("Output Folder", value="Saved_Peaks")
 
 
@@ -1125,24 +1161,28 @@ ppg_peaks_ref = (beat_times_s * ref_fs).astype(int) if len(beat_times_s) > 0 els
 ppg_peaks_full = (beat_times_s * fs_proc).astype(int)
 ppg_peaks_full = ppg_peaks_full[(ppg_peaks_full >= 0) & (ppg_peaks_full < len(scg_proc_full))]
 
-if ppg_filtered is not None:
+if ppg_vis_filtered is not None:
     st.subheader("Processed PPG and Detected Peaks")
     ppg_time_s = ppg_df["time_s"].to_numpy(dtype=float)
     fig_ppg = go.Figure()
     fig_ppg.add_trace(
         go.Scatter(
             x=ppg_time_s,
-            y=ppg_filtered,
+            y=ppg_vis_filtered,
             mode="lines",
             name="PPG (Bandpassed)",
             line=dict(width=1.2, color="#ff4757"),
         )
     )
-    if len(ppg_peaks_idx) > 0:
+    if beat_source == "Detect from PPG raw":
+        plot_peaks_idx = ppg_vis_peaks_idx
+    else:
+        plot_peaks_idx = _map_times_to_indices(ppg_time_s, beat_times_s)
+    if len(plot_peaks_idx) > 0:
         fig_ppg.add_trace(
             go.Scatter(
-                x=ppg_time_s[ppg_peaks_idx],
-                y=ppg_filtered[ppg_peaks_idx],
+                x=ppg_time_s[plot_peaks_idx],
+                y=ppg_vis_filtered[plot_peaks_idx],
                 mode="markers",
                 name="PPG Peaks",
                 marker=dict(color="#00e5ff", size=6, symbol="circle"),
@@ -1183,12 +1223,15 @@ if run_window_btn:
 
         comparison = None
         detection_metrics_window = None
+        iqr_removed_ao_centers_s = np.array([])
+        iqr_removed_ppg_centers_s = np.array([])
         if len(peaks) > 0 and len(ppg_peaks_window_ref) > 0:
             detection_metrics_window = compute_detection_metrics(
                 peaks_abs,
                 ppg_peaks_window_ref,
                 fs_proc,
                 ref_fs,
+                tolerance_seconds=0.2,
             )
         if len(peaks) > 1 and len(ppg_peaks_window) > 1:
             (
@@ -1256,6 +1299,21 @@ if run_window_btn:
         if len(ppg_peaks_window) > 0:
             for bt in time_axis[ppg_peaks_window]:
                 fig_overlay.add_vline(x=float(bt), line_width=1, line_dash="dash", line_color="green")
+        if use_iqr_filter:
+            for center_s in iqr_removed_ao_centers_s:
+                fig_overlay.add_vline(
+                    x=float(start_time + center_s),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(255, 140, 0, 0.7)",
+                )
+            for center_s in iqr_removed_ppg_centers_s:
+                fig_overlay.add_vline(
+                    x=float(start_time + center_s),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(0, 229, 255, 0.7)",
+                )
 
         if detection_metrics_window:
             fp_peaks = detection_metrics_window.get("fp_peaks", np.array([], dtype=int)).astype(int)
@@ -1299,6 +1357,21 @@ if run_window_btn:
                     marker=dict(color="red", size=6),
                 )
             )
+        if use_iqr_filter:
+            for center_s in iqr_removed_ao_centers_s:
+                fig_env.add_vline(
+                    x=float(start_time + center_s),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(255, 140, 0, 0.7)",
+                )
+            for center_s in iqr_removed_ppg_centers_s:
+                fig_env.add_vline(
+                    x=float(start_time + center_s),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(0, 229, 255, 0.7)",
+                )
         fig_env.update_layout(
             title="AO Reconstruction and Envelope",
             xaxis_title="Time (s)",
@@ -1531,6 +1604,26 @@ if full_record_btn:
         saved_file = save_peaks_to_json(global_peaks, fs_proc, file_label, output_folder)
         st.info(f"AO Peaks saved to: {saved_file}")
 
+    if (
+        save_ppg_json_output
+        and beat_source == "Detect from PPG raw"
+        and not ppg_df.empty
+        and len(ppg_vis_peaks_idx) > 0
+    ):
+        ppg_time_full = ppg_df["time_s"].to_numpy(dtype=float)
+        ppg_peak_times = ppg_time_full[ppg_vis_peaks_idx]
+        ppg_peak_times = ppg_peak_times[
+            (ppg_peak_times >= float(trim_start)) & (ppg_peak_times < float(trim_end))
+        ]
+        if len(ppg_peak_times) > 0:
+            saved_file_ppg = save_peaks_seconds_to_json(
+                ppg_peak_times,
+                file_label,
+                output_folder,
+                peak_label="PPG",
+            )
+            st.info(f"PPG Peaks saved to: {saved_file_ppg}")
+
     full_time_axis = np.arange(len(scg_proc_full)) / fs_proc + trim_start
     if len(scg_raw) == len(scg_proc_full):
         scg_raw_display = scg_raw
@@ -1551,6 +1644,28 @@ if full_record_btn:
             ppg_peaks_ref_trim,
             fs_proc,
             ref_fs,
+            tolerance_seconds=0.2,
+        )
+
+    ao_intervals_matched = np.array([])
+    ppg_intervals_matched = np.array([])
+    ao_centers_s = np.array([])
+    ppg_centers_s = np.array([])
+    iqr_removed_ao_centers_s = np.array([])
+    iqr_removed_ppg_centers_s = np.array([])
+    if len(all_ao_peaks) > 1 and len(ppg_peaks_full) > 1:
+        (
+            ao_intervals_matched,
+            ppg_intervals_matched,
+            ao_centers_s,
+            ppg_centers_s,
+            iqr_removed_ao_centers_s,
+            iqr_removed_ppg_centers_s,
+        ) = match_intervals_by_time(
+            all_ao_peaks,
+            ppg_peaks_full,
+            fs_proc,
+            apply_iqr=use_iqr_filter,
         )
 
     has_ppg_vis = ppg_vis_filtered is not None and not ppg_df.empty
@@ -1706,10 +1821,15 @@ if full_record_btn:
         ppg_mask = (ppg_time_full >= trim_start) & (ppg_time_full <= trim_end)
         ppg_time_trim = ppg_time_full[ppg_mask]
         ppg_filtered_trim = ppg_vis_filtered[ppg_mask]
-        ppg_peaks_in_trim = ppg_vis_peaks_idx[
-            (ppg_time_full[ppg_vis_peaks_idx] >= trim_start)
-            & (ppg_time_full[ppg_vis_peaks_idx] <= trim_end)
-        ]
+        if beat_source == "Detect from PPG raw":
+            ppg_peaks_in_trim = ppg_vis_peaks_idx[
+                (ppg_time_full[ppg_vis_peaks_idx] >= trim_start)
+                & (ppg_time_full[ppg_vis_peaks_idx] <= trim_end)
+            ]
+        else:
+            beat_mask = (beat_times_s >= trim_start) & (beat_times_s <= trim_end)
+            beat_times_trim = beat_times_s[beat_mask]
+            ppg_peaks_in_trim = _map_times_to_indices(ppg_time_full, beat_times_trim)
 
         fig_intervals.add_trace(
             go.Scatter(
@@ -1734,6 +1854,25 @@ if full_record_btn:
                 row=3,
                 col=1,
             )
+        if use_iqr_filter:
+            for center_s in iqr_removed_ao_centers_s:
+                fig_intervals.add_vline(
+                    x=float(center_s + trim_start),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(255, 140, 0, 0.6)",
+                    row=2,
+                    col=1,
+                )
+            for center_s in iqr_removed_ppg_centers_s:
+                fig_intervals.add_vline(
+                    x=float(center_s + trim_start),
+                    line_width=1,
+                    line_dash="dot",
+                    line_color="rgba(0, 229, 255, 0.6)",
+                    row=3,
+                    col=1,
+                )
         intervals_row = 4
 
     if len(ppg_interval_times_full) > 0:
@@ -1782,20 +1921,6 @@ if full_record_btn:
     st.plotly_chart(fig_intervals, use_container_width=True)
 
     if len(all_ao_peaks) > 1 and len(ppg_peaks_full) > 1:
-        (
-            ao_intervals_matched,
-            ppg_intervals_matched,
-            ao_centers_s,
-            ppg_centers_s,
-            iqr_removed_ao_centers_s,
-            iqr_removed_ppg_centers_s,
-        ) = match_intervals_by_time(
-            all_ao_peaks,
-            ppg_peaks_full,
-            fs_proc,
-            apply_iqr=use_iqr_filter,
-        )
-
         if sample_bad_mask_full_record is not None and show_sqa_overlay:
             ao_center_idx = np.minimum(
                 (ao_centers_s * fs_proc).astype(int),
