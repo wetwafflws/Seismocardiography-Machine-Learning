@@ -515,6 +515,28 @@ def sqa_envelope(segment, threshold=2.5):
     return (np.std(env) / (np.mean(env) + 1e-9)) > threshold
 
 
+def _derive_rms_bounds(seg_rms, rms_low_percentile=20, rms_high_percentile=80, rms_low_mad_mult=2.0, rms_high_mad_mult=4.0):
+    valid_rms = np.asarray(seg_rms, dtype=float)
+    valid_rms = valid_rms[np.isfinite(valid_rms)]
+    if len(valid_rms) == 0:
+        return 1e-10, float("inf")
+
+    rms_low_perc = float(np.percentile(valid_rms, rms_low_percentile))
+    rms_high_perc = float(np.percentile(valid_rms, rms_high_percentile))
+    rms_med = float(np.median(valid_rms))
+    rms_mad = float(np.median(np.abs(valid_rms - rms_med)))
+
+    rms_low_thr = max(rms_low_perc, rms_med - rms_low_mad_mult * rms_mad) if rms_mad > 1e-12 else rms_low_perc
+    rms_high_thr = max(rms_high_perc, rms_med + rms_high_mad_mult * rms_mad) if rms_mad > 1e-12 else rms_high_perc * 3.0
+    return float(rms_low_thr), float(rms_high_thr)
+
+
+def sqa_rms(segment, rms_low_thr, rms_high_thr):
+    seg_det = signal.detrend(np.asarray(segment, dtype=float))
+    rms_value = float(np.sqrt(np.mean(seg_det ** 2)))
+    return (rms_value < rms_low_thr) or (rms_value > rms_high_thr), rms_value
+
+
 def sqa_combined(
     segment,
     fs,
@@ -525,12 +547,16 @@ def sqa_combined(
     cv_thresh=0.01,
     diff_thresh=1e-4,
     env_thresh=2.5,
+    rms_low_thr=1e-10,
+    rms_high_thr=float("inf"),
 ):
+    rms_flag, _ = sqa_rms(segment, rms_low_thr, rms_high_thr)
     flags = [
         sqa_kurtosis(segment, kurt_thresh),
         sqa_zcr(segment, fs, zcr_low, zcr_high),
         sqa_flatline(segment, cv_thresh, diff_thresh),
         sqa_envelope(segment, env_thresh),
+        rms_flag,
     ]
     return sum(flags) >= min_flags, flags
 
@@ -546,6 +572,10 @@ def combined_sqa_for_signal(
     cv_thresh=0.01,
     diff_thresh=1e-4,
     env_thresh=2.5,
+    rms_low_percentile=20,
+    rms_high_percentile=80,
+    rms_low_mad_mult=2.0,
+    rms_high_mad_mult=4.0,
 ):
     x = np.asarray(signal_in, dtype=float).flatten()
     n = len(x)
@@ -554,7 +584,9 @@ def combined_sqa_for_signal(
             "segment_starts": np.array([]),
             "segment_ends": np.array([]),
             "bad_mask": np.array([], dtype=bool),
-            "flags": np.empty((0, 4), dtype=bool),
+            "flags": np.empty((0, 5), dtype=bool),
+            "seg_rms": np.array([]),
+            "rms_bounds": {"low": np.nan, "high": np.nan},
             "method": "combined",
         }
 
@@ -562,13 +594,29 @@ def combined_sqa_for_signal(
     seg_starts = np.arange(0, n, seg_len)
     seg_ends = np.minimum(seg_starts + seg_len, n)
 
-    bad_mask = []
-    flags_all = []
+    seg_rms_all = []
     for s, e in zip(seg_starts, seg_ends):
         seg = x[s:e]
         if len(seg) < 16:
+            seg_rms_all.append(np.nan)
+            continue
+        seg_rms_all.append(float(np.sqrt(np.mean(signal.detrend(seg) ** 2))))
+
+    rms_low_thr, rms_high_thr = _derive_rms_bounds(
+        seg_rms_all,
+        rms_low_percentile=rms_low_percentile,
+        rms_high_percentile=rms_high_percentile,
+        rms_low_mad_mult=rms_low_mad_mult,
+        rms_high_mad_mult=rms_high_mad_mult,
+    )
+
+    bad_mask = []
+    flags_all = []
+    for s, e, rms_value in zip(seg_starts, seg_ends, seg_rms_all):
+        seg = x[s:e]
+        if len(seg) < 16:
             bad_mask.append(True)
-            flags_all.append([True, True, True, True])
+            flags_all.append([True, True, True, True, True])
             continue
         is_bad, flags = sqa_combined(
             seg,
@@ -580,6 +628,8 @@ def combined_sqa_for_signal(
             cv_thresh=cv_thresh,
             diff_thresh=diff_thresh,
             env_thresh=env_thresh,
+            rms_low_thr=rms_low_thr,
+            rms_high_thr=rms_high_thr,
         )
         bad_mask.append(is_bad)
         flags_all.append(flags)
@@ -589,6 +639,8 @@ def combined_sqa_for_signal(
         "segment_ends": seg_ends,
         "bad_mask": np.asarray(bad_mask, dtype=bool),
         "flags": np.asarray(flags_all, dtype=bool),
+        "seg_rms": np.asarray(seg_rms_all, dtype=float),
+        "rms_bounds": {"low": float(rms_low_thr), "high": float(rms_high_thr)},
         "method": "combined",
     }
 
@@ -965,7 +1017,7 @@ with st.sidebar:
     min_flags_to_reject = st.slider(
         "Minimum detectors to flag a window as bad",
         min_value=1,
-        max_value=4,
+        max_value=5,
         value=2,
         step=1,
     )
@@ -975,6 +1027,13 @@ with st.sidebar:
         zcr_low = st.slider("ZCR low bound (Hz)", 0.1, 2.0, 0.5, 0.1)
         zcr_high = st.slider("ZCR high bound (Hz)", 2.0, 20.0, 5.0, 0.5)
         env_thresh = st.slider("Envelope CV threshold", 1.0, 5.0, 2.5, 0.1)
+        col_rms1, col_rms2 = st.columns(2)
+        with col_rms1:
+            rms_low_percentile = st.slider("RMS low percentile", 5, 30, 20, 1)
+            rms_low_mad_mult = st.slider("RMS low MAD multiplier", 0.5, 4.0, 2.0, 0.25)
+        with col_rms2:
+            rms_high_percentile = st.slider("RMS high percentile", 70, 95, 80, 1)
+            rms_high_mad_mult = st.slider("RMS high MAD multiplier", 2.0, 8.0, 4.0, 0.25)
 
     exclude_bad_windows = st.checkbox(
         "Skip very noisy windows in Full Record Analysis",
@@ -1195,7 +1254,7 @@ if ppg_vis_filtered is not None:
         plot_bgcolor="white",
         showlegend=True,
     )
-    st.plotly_chart(fig_ppg, use_container_width=True)
+    st.plotly_chart(fig_ppg, width="stretch")
 
 if run_window_btn:
     start_idx = int(start_time * fs_proc)
@@ -1341,7 +1400,7 @@ if run_window_btn:
             height=360,
             plot_bgcolor="white",
         )
-        st.plotly_chart(fig_overlay, use_container_width=True)
+        st.plotly_chart(fig_overlay, width="stretch")
 
         fig_env = go.Figure()
         fig_env.add_trace(go.Scatter(x=time_axis, y=s_ao, mode="lines", name="Reconstructed AO"))
@@ -1379,7 +1438,7 @@ if run_window_btn:
             height=360,
             plot_bgcolor="white",
         )
-        st.plotly_chart(fig_env, use_container_width=True)
+        st.plotly_chart(fig_env, width="stretch")
 
         if comparison is not None:
             st.subheader("AO-AO vs PPG-PPG Interval Comparison")
@@ -1410,13 +1469,13 @@ if run_window_btn:
                         if removed_ao.size > 0:
                             st.dataframe(
                                 pd.DataFrame({"ao_interval_center_s": removed_ao + start_time}),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
                         if removed_ppg.size > 0:
                             st.dataframe(
                                 pd.DataFrame({"ppg_interval_center_s": removed_ppg + start_time}),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
 
@@ -1445,7 +1504,7 @@ if run_window_btn:
                                     "fp_time_s": fp_times,
                                 }
                             ),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
                     if len(fn_times) > 0:
@@ -1456,7 +1515,7 @@ if run_window_btn:
                                     "fn_time_s": fn_times,
                                 }
                             ),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
 
@@ -1511,6 +1570,10 @@ if full_record_btn:
             zcr_low=float(zcr_low),
             zcr_high=float(zcr_high),
             env_thresh=float(env_thresh),
+            rms_low_percentile=int(rms_low_percentile),
+            rms_high_percentile=int(rms_high_percentile),
+            rms_low_mad_mult=float(rms_low_mad_mult),
+            rms_high_mad_mult=float(rms_high_mad_mult),
         )
         sample_bad_mask_full_record = build_sample_bad_mask(len(scg_proc_full), sqa_result_full_record)
 
@@ -1520,13 +1583,13 @@ if full_record_btn:
         )
 
         if show_sqa_breakdown:
-            flag_rows = sqa_result_full_record.get("flags", np.empty((0, 4), dtype=bool))
+            flag_rows = sqa_result_full_record.get("flags", np.empty((0, 5), dtype=bool))
             if len(flag_rows) > 0:
                 sqa_breakdown_df = pd.DataFrame(
                     flag_rows,
-                    columns=["Kurtosis", "ZCR", "Flatline", "Envelope"],
+                    columns=["Kurtosis", "ZCR", "Flatline", "Envelope", "RMS"],
                 )
-                st.dataframe(sqa_breakdown_df, use_container_width=True, hide_index=True)
+                st.dataframe(sqa_breakdown_df, width="stretch", hide_index=True)
 
     status_text = st.empty()
     progress_bar = st.progress(0)
@@ -1918,7 +1981,7 @@ if full_record_btn:
     if has_ppg_vis:
         fig_intervals.update_yaxes(title_text="PPG (Filtered)", row=3, col=1)
     fig_intervals.update_yaxes(title_text="Interval (ms)", row=intervals_row, col=1)
-    st.plotly_chart(fig_intervals, use_container_width=True)
+    st.plotly_chart(fig_intervals, width="stretch")
 
     if len(all_ao_peaks) > 1 and len(ppg_peaks_full) > 1:
         if sample_bad_mask_full_record is not None and show_sqa_overlay:
@@ -1985,13 +2048,13 @@ if full_record_btn:
                         if iqr_removed_ao_centers_s.size > 0:
                             st.dataframe(
                                 pd.DataFrame({"ao_interval_center_s": iqr_removed_ao_centers_s + trim_start}),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
                         if iqr_removed_ppg_centers_s.size > 0:
                             st.dataframe(
                                 pd.DataFrame({"ppg_interval_center_s": iqr_removed_ppg_centers_s + trim_start}),
-                                use_container_width=True,
+                                width="stretch",
                                 hide_index=True,
                             )
 
@@ -2026,7 +2089,7 @@ if full_record_btn:
                                     "fp_time_s": fp_times,
                                 }
                             ),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
                     if len(fn_times) > 0:
@@ -2037,7 +2100,7 @@ if full_record_btn:
                                     "fn_time_s": fn_times,
                                 }
                             ),
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
 
@@ -2084,7 +2147,7 @@ if full_record_btn:
                 height=420,
                 plot_bgcolor="white",
             )
-            st.plotly_chart(fig_ba, use_container_width=True)
+            st.plotly_chart(fig_ba, width="stretch")
 
             fig_corr = go.Figure()
             fig_corr.add_trace(
@@ -2117,7 +2180,7 @@ if full_record_btn:
             )
             fig_corr.update_xaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
             fig_corr.update_yaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
-            st.plotly_chart(fig_corr, use_container_width=True)
+            st.plotly_chart(fig_corr, width="stretch")
 
     else:
         st.warning("Not enough peaks detected for interval comparison.")
