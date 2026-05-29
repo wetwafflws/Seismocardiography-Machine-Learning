@@ -124,10 +124,12 @@ This app only performs:
 - signal and attention visualization
 - single-patient and batch inference export
 
-### Option 3: Streamlit Web Interface
+### Option 3: PyQt5 Desktop Interface
 ```bash
-streamlit run TA_SVMD.py
+python raw_svmd_qt.py
 ```
+
+The legacy `streamlit_raw_svmd.py` entry point now launches the same PyQt5 desktop app.
 
 ## Pre-trained Models
 
