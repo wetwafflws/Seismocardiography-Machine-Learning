@@ -572,6 +572,8 @@ REQUIRED_COLS = ["timestamp_ms", "x_g", "y_g", "z_g", "beat_event"]
 OPTIONAL_PPG_COL = "ppg_raw"
 DEFAULT_SEARCH_DIR = "SUBJECT_Data"
 META_SUFFIX = "_meta.json"
+ML_EXPORT_DIR = "Subject_Data_Segmented"
+ML_TARGET_FS = 256
 
 
 class MplCanvas(FigureCanvas):
@@ -858,6 +860,14 @@ def format_timestamp(seconds_val: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:07.4f}"
 
 
+def parse_timestamp_to_seconds(time_str: str) -> float:
+    parts = str(time_str).strip().split(":")
+    if len(parts) != 3:
+        return 0.0
+    h, m, s = parts
+    return int(h) * 3600 + int(m) * 60 + float(s)
+
+
 def _build_peaks_payload(peak_seconds, record_name: str, peak_label: str) -> dict:
     timestamps = [format_timestamp(float(sec)) for sec in peak_seconds]
     return {f"{record_name}_{peak_label}_Peaks": timestamps}
@@ -881,6 +891,133 @@ def save_peaks_seconds_to_json(peak_seconds, record_name, output_dir="Saved_Peak
     with open(out_path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=4)
     return out_path
+
+
+def export_subject_for_ml(
+    df,
+    meta_fields,
+    ao_peaks_indices,
+    fs_proc,
+    output_base_dir,
+    ppg_peak_times_s=None,
+    ppg_raw=None,
+    ppg_fs=None,
+    ppg_key="PPG_Peaks",
+):
+    if df is None or df.empty:
+        raise ValueError("No SCG data available for export.")
+
+    patient_id = meta_fields.get("patient_id") or "subject"
+    target_fs = int(meta_fields.get("target_fs", ML_TARGET_FS))
+
+    if fs_proc and float(fs_proc) > 0:
+        original_fs = float(fs_proc)
+    else:
+        _, inferred_fs = _compute_rate_from_ts(df["timestamp_ms"].to_numpy(dtype=float))
+        original_fs = float(inferred_fs) if inferred_fs > 0 else float(target_fs)
+
+    scg_x = np.nan_to_num(df["x_g"].to_numpy(dtype=float))
+    scg_y = np.nan_to_num(df["y_g"].to_numpy(dtype=float))
+    scg_z = np.nan_to_num(df["z_g"].to_numpy(dtype=float))
+
+    if original_fs != target_fs:
+        new_len = int(round(len(scg_x) * target_fs / original_fs))
+        scg_x = signal.resample(scg_x, new_len)
+        scg_y = signal.resample(scg_y, new_len)
+        scg_z = signal.resample(scg_z, new_len)
+    else:
+        new_len = len(scg_x)
+
+    start_ts_ms = float(df["timestamp_ms"].iloc[0])
+    ts_ms = start_ts_ms + np.arange(new_len, dtype=float) * (1000.0 / float(target_fs))
+    host_ts_ms = ts_ms.copy()
+
+    beat_event = np.zeros(new_len, dtype=int)
+    if ppg_peak_times_s is not None and len(ppg_peak_times_s) > 0:
+        peak_idx = np.round(np.asarray(ppg_peak_times_s, dtype=float) * float(target_fs)).astype(int)
+        peak_idx = peak_idx[(peak_idx >= 0) & (peak_idx < new_len)]
+        beat_event[peak_idx] = 1
+
+    ppg_raw_series = None
+    if ppg_raw is not None and len(ppg_raw) > 0 and ppg_fs and float(ppg_fs) > 0:
+        if float(ppg_fs) != float(target_fs):
+            ppg_raw_series = signal.resample(np.asarray(ppg_raw, dtype=float), new_len)
+        else:
+            ppg_raw_series = np.asarray(ppg_raw, dtype=float)
+
+    export_df = pd.DataFrame({
+        "timestamp_ms": ts_ms,
+        "host_time_ms": host_ts_ms,
+        "x_g": scg_x,
+        "y_g": scg_y,
+        "z_g": scg_z,
+        "ppg_raw": ppg_raw_series if ppg_raw_series is not None else [""] * new_len,
+        "beat_event": beat_event,
+    })
+
+    session_start = meta_fields.get("session_start")
+    try:
+        session_dt = datetime.fromisoformat(session_start) if session_start else datetime.now()
+    except ValueError:
+        session_dt = datetime.now()
+
+    date_dir = Path(output_base_dir) / session_dt.strftime("%Y-%m-%d")
+    date_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = date_dir / f"{patient_id}.csv"
+    meta_path = date_dir / f"{patient_id}_meta.json"
+
+    conditions = meta_fields.get("cardiac_conditions") or ["Normal"]
+    cond_str = ", ".join(conditions)
+
+    meta_lines = [
+        f"SCG/PPG Recording - {session_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+        f"patient_initials,{meta_fields.get('patient_initials', '')}",
+        f"age,{meta_fields.get('age', '')}",
+        f"sex,{meta_fields.get('sex', '')}",
+        f"weight_kg,{meta_fields.get('weight_kg', '')}",
+        f"height_cm,{meta_fields.get('height_cm', '')}",
+        f"bmi,{meta_fields.get('bmi', '')}",
+        f"cardiac_conditions,{cond_str}",
+        f"notes,{meta_fields.get('notes', '')}",
+        f"sample_rate_scg_hz,{target_fs}",
+        f"sample_rate_ppg_hz,{meta_fields.get('sample_rate_ppg_hz', PPG_SAMPLE_RATE)}",
+    ]
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        for line in meta_lines:
+            handle.write(f"# {line}\n")
+        export_df.to_csv(handle, index=False)
+
+    meta_json = {
+        "session_start": session_dt.isoformat(),
+        "patient_initials": meta_fields.get("patient_initials", ""),
+        "age": meta_fields.get("age"),
+        "sex": meta_fields.get("sex"),
+        "weight_kg": meta_fields.get("weight_kg"),
+        "height_cm": meta_fields.get("height_cm"),
+        "bmi": meta_fields.get("bmi"),
+        "cardiac_conditions": conditions,
+        "notes": meta_fields.get("notes", ""),
+        "sample_rate_scg_hz": target_fs,
+        "sample_rate_ppg_hz": meta_fields.get("sample_rate_ppg_hz", PPG_SAMPLE_RATE),
+        "filter_enabled": meta_fields.get("filter_enabled"),
+        "notch_50hz_enabled": meta_fields.get("notch_50hz_enabled"),
+    }
+
+    meta_json = {k: v for k, v in meta_json.items() if v not in (None, "")}
+    with meta_path.open("w", encoding="utf-8") as handle:
+        json.dump(meta_json, handle, indent=2)
+
+    if ppg_peak_times_s is not None and len(ppg_peak_times_s) > 0:
+        ppg_times = [format_timestamp(float(sec)) for sec in ppg_peak_times_s]
+        ppg_path = date_dir / f"{patient_id}-PPG.json"
+        with ppg_path.open("w", encoding="utf-8") as handle:
+            json.dump({ppg_key: ppg_times}, handle, indent=2)
+
+    if ao_peaks_indices is not None and len(ao_peaks_indices) > 0:
+        save_peaks_to_json(ao_peaks_indices, fs_proc, patient_id, output_dir="Saved_Peaks", peak_label="AO")
+
+    return {"csv_path": str(csv_path), "meta_path": str(meta_path)}
 
 
 def _map_times_to_indices(time_axis_s: np.ndarray, event_times_s: np.ndarray) -> np.ndarray:
@@ -2326,6 +2463,157 @@ class SubjectDialog(QDialog):
         }
 
 
+class ExportMlDialog(QDialog):
+    def __init__(self, parent=None, patient_id: str = "", existing: dict | None = None):
+        super().__init__(parent)
+        self._patient_id = patient_id
+        self.setWindowTitle("Export for ML")
+        self.setMinimumWidth(420)
+        self.setModal(True)
+        self._build_ui(existing or {})
+
+    def _build_ui(self, d: dict):
+        layout = QVBoxLayout(self)
+        layout.setSpacing(12)
+        layout.setContentsMargins(20, 20, 20, 20)
+
+        hdr = QLabel("EXPORT SUBJECT FOR ML")
+        hdr.setObjectName("section_title")
+        layout.addWidget(hdr)
+
+        pid = QLabel(f"Patient ID: {self._patient_id}")
+        pid.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
+        layout.addWidget(pid)
+
+        sep = QFrame(); sep.setObjectName("separator")
+        layout.addWidget(sep)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+        form.setLabelAlignment(Qt.AlignRight)
+
+        self._initials = QLineEdit(d.get("patient_initials", ""))
+        self._initials.setPlaceholderText("Optional initials")
+        self._initials.setMaxLength(6)
+        form.addRow("Initials", self._initials)
+
+        self._age = QSpinBox()
+        self._age.setRange(0, 120)
+        self._age.setValue(int(d.get("age", 0) or 0))
+        form.addRow("Age (yrs)", self._age)
+
+        self._sex = QComboBox()
+        self._sex.addItems(["", "Male", "Female", "Other / Not specified"])
+        existing_sex = d.get("sex", "")
+        if existing_sex in ["Male", "Female", "Other / Not specified"]:
+            self._sex.setCurrentText(existing_sex)
+        form.addRow("Sex", self._sex)
+
+        self._weight = QDoubleSpinBox()
+        self._weight.setRange(0.0, 300.0)
+        self._weight.setDecimals(1)
+        self._weight.setSuffix(" kg")
+        self._weight.setValue(float(d.get("weight_kg", 0.0) or 0.0))
+        self._weight.valueChanged.connect(self._update_bmi)
+        form.addRow("Weight", self._weight)
+
+        self._height = QDoubleSpinBox()
+        self._height.setRange(0.0, 250.0)
+        self._height.setDecimals(1)
+        self._height.setSuffix(" cm")
+        self._height.setValue(float(d.get("height_cm", 0.0) or 0.0))
+        self._height.valueChanged.connect(self._update_bmi)
+        form.addRow("Height", self._height)
+
+        self._bmi_lbl = QLabel()
+        self._bmi_lbl.setObjectName("stat_value")
+        self._bmi_lbl.setStyleSheet(f"color:{ACCENT};font-size:14px;font-weight:bold;")
+        form.addRow("BMI", self._bmi_lbl)
+
+        layout.addLayout(form)
+
+        cond_group = QGroupBox("CARDIAC CONDITIONS")
+        cond_layout = QVBoxLayout(cond_group)
+        cond_layout.setSpacing(4)
+
+        self._normal_cb = QCheckBox("Normal")
+        self._normal_cb.toggled.connect(self._on_normal_toggled)
+        cond_layout.addWidget(self._normal_cb)
+
+        sep2 = QFrame(); sep2.setObjectName("separator")
+        cond_layout.addWidget(sep2)
+
+        self._cond_cbs: dict[str, QCheckBox] = {}
+        for key in ["MS", "MR", "AR", "AS", "TR"]:
+            cb = QCheckBox(key)
+            cb.toggled.connect(self._on_condition_toggled)
+            cond_layout.addWidget(cb)
+            self._cond_cbs[key] = cb
+
+        existing_conds = d.get("cardiac_conditions", [])
+        if isinstance(existing_conds, str):
+            existing_conds = [existing_conds]
+        existing_conds = [str(c).strip().upper() for c in existing_conds if c]
+        if "NORMAL" in existing_conds or not existing_conds:
+            self._normal_cb.setChecked(True)
+        else:
+            for key, cb in self._cond_cbs.items():
+                cb.setChecked(key in existing_conds)
+
+        layout.addWidget(cond_group)
+
+        self._notes = QLineEdit(d.get("notes", ""))
+        self._notes.setPlaceholderText("Optional notes")
+        layout.addWidget(QLabel("Notes"))
+        layout.addWidget(self._notes)
+
+        self._buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        self._buttons.accepted.connect(self.accept)
+        self._buttons.rejected.connect(self.reject)
+        layout.addWidget(self._buttons)
+
+        self._update_bmi()
+        self._on_normal_toggled(self._normal_cb.isChecked())
+
+    def _update_bmi(self):
+        h_cm = self._height.value()
+        h_m = h_cm / 100.0 if h_cm > 0 else 0.0
+        bmi = self._weight.value() / (h_m * h_m) if h_m > 0 else 0.0
+        self._bmi_lbl.setText(f"{bmi:.1f}" if bmi > 0 else "-")
+
+    def _on_normal_toggled(self, checked: bool):
+        for cb in self._cond_cbs.values():
+            cb.setEnabled(not checked)
+            if checked:
+                cb.setChecked(False)
+
+    def _on_condition_toggled(self, checked: bool):
+        if checked:
+            self._normal_cb.setChecked(False)
+
+    def get_metadata(self) -> dict:
+        h_cm = self._height.value()
+        h_m = h_cm / 100.0 if h_cm > 0 else 0.0
+        bmi = self._weight.value() / (h_m * h_m) if h_m > 0 else None
+        conditions = [k for k, cb in self._cond_cbs.items() if cb.isChecked()]
+        if self._normal_cb.isChecked() or not conditions:
+            conditions = ["Normal"]
+
+        initials = self._initials.text().strip().upper()
+        sex = self._sex.currentText().strip()
+
+        return {
+            "patient_initials": initials,
+            "age": self._age.value() if self._age.value() > 0 else None,
+            "sex": sex if sex else None,
+            "weight_kg": round(self._weight.value(), 1) if self._weight.value() > 0 else None,
+            "height_cm": round(self._height.value(), 1) if self._height.value() > 0 else None,
+            "bmi": round(bmi, 1) if bmi is not None else None,
+            "cardiac_conditions": conditions,
+            "notes": self._notes.text().strip(),
+        }
+
+
 class RawScgSvmdWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -2594,6 +2882,19 @@ class RawScgSvmdWindow(QMainWindow):
         actions_layout.addWidget(self.preview_button)
         actions_layout.addWidget(self.run_window_button)
         actions_layout.addWidget(self.run_full_button)
+        self.batch_export_button = QPushButton("Batch Export >=")
+        self.batch_min_seconds_spin = QDoubleSpinBox()
+        self.batch_min_seconds_spin.setRange(1.0, 1e6)
+        self.batch_min_seconds_spin.setDecimals(1)
+        self.batch_min_seconds_spin.setValue(300.0)
+        self.batch_min_seconds_spin.setSuffix(" s")
+        batch_row = QHBoxLayout()
+        batch_row.addWidget(self.batch_export_button)
+        batch_row.addWidget(self.batch_min_seconds_spin)
+        actions_layout.addLayout(batch_row)
+        self.batch_export_status = QLabel("")
+        self.batch_export_status.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
+        actions_layout.addWidget(self.batch_export_status)
         self.progress_bar = QProgressBar(); self.progress_bar.setRange(0, 100)
         self.status_label = QLabel("Ready")
         actions_layout.addWidget(self.progress_bar)
@@ -2712,6 +3013,18 @@ class RawScgSvmdWindow(QMainWindow):
         self.full_layout.addWidget(self.detection_errors_table)
         self.full_layout.addWidget(QLabel("Removed Intervals"))
         self.full_layout.addWidget(self.iqr_table)
+
+        export_group = QGroupBox("ML Export")
+        export_layout = QHBoxLayout(export_group)
+        export_layout.setSpacing(10)
+        self.export_ml_button = QPushButton("Export for ML")
+        self.export_ml_button.setEnabled(False)
+        self.export_ml_status = QLabel("")
+        self.export_ml_status.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
+        export_layout.addWidget(self.export_ml_button)
+        export_layout.addWidget(self.export_ml_status, stretch=1)
+        self.full_layout.addWidget(export_group)
+
         self.full_layout.addStretch(1)
 
         logs_layout = QVBoxLayout(self.logs_tab)
@@ -2913,6 +3226,8 @@ class RawScgSvmdWindow(QMainWindow):
         self.preview_button.clicked.connect(self._refresh_preview)
         self.run_window_button.clicked.connect(self._run_window_analysis)
         self.run_full_button.clicked.connect(self._run_full_analysis)
+        self.export_ml_button.clicked.connect(self._export_full_record_for_ml)
+        self.batch_export_button.clicked.connect(self._batch_export_for_ml)
         self.source_mode.currentIndexChanged.connect(self._update_source_controls)
         self.beat_source_combo.currentIndexChanged.connect(self._update_ppg_json_toggle)
         self.date_combo.currentIndexChanged.connect(self._on_date_changed)
@@ -3241,6 +3556,12 @@ class RawScgSvmdWindow(QMainWindow):
         self.df = df
         self.current_csv_path = csv_path
         self.file_label = Path(csv_path).stem
+        self.full_result = None
+        if hasattr(self, "export_ml_button"):
+            self.export_ml_button.setEnabled(False)
+            self.export_ml_status.setText("")
+        if hasattr(self, "batch_export_status"):
+            self.batch_export_status.setText("")
 
         try:
             self.meta_data, self.meta_path_display = _read_metadata_for_csv(csv_path)
@@ -3384,6 +3705,8 @@ class RawScgSvmdWindow(QMainWindow):
         self.full_result = result
         self._render_full_result(result)
         self.tabs.setCurrentWidget(self.full_tab)
+        self.export_ml_button.setEnabled(True)
+        self.export_ml_status.setText("Ready to export")
         for message in result.get("save_messages", []):
             self._log(message)
             QMessageBox.information(self, "Saved", message)
@@ -3476,6 +3799,269 @@ class RawScgSvmdWindow(QMainWindow):
             return
         self._set_status("Running full record analysis...")
         self._start_worker("full", inputs)
+
+    def _build_export_defaults(self) -> dict:
+        defaults = {}
+        meta = self.meta_data or {}
+        if meta:
+            defaults.update({
+                "patient_initials": meta.get("patient_initials", ""),
+                "age": meta.get("age"),
+                "sex": meta.get("sex"),
+                "weight_kg": meta.get("weight_kg"),
+                "height_cm": meta.get("height_cm"),
+                "bmi": meta.get("bmi"),
+                "cardiac_conditions": meta.get("cardiac_conditions", []),
+                "notes": meta.get("notes", ""),
+                "session_start": meta.get("session_start"),
+                "sample_rate_ppg_hz": meta.get("sample_rate_ppg_hz", PPG_SAMPLE_RATE),
+                "filter_enabled": meta.get("filter_enabled"),
+                "notch_50hz_enabled": meta.get("notch_50hz_enabled"),
+            })
+
+        if not defaults and self._subject:
+            defaults.update({
+                "patient_initials": self._subject.get("initials", ""),
+                "age": self._subject.get("age"),
+                "sex": self._subject.get("sex"),
+                "weight_kg": self._subject.get("weight_kg"),
+                "height_cm": self._subject.get("height_cm"),
+                "bmi": self._subject.get("bmi"),
+                "cardiac_conditions": self._subject.get("conditions", []),
+                "notes": self._subject.get("notes", ""),
+                "sample_rate_ppg_hz": PPG_SAMPLE_RATE,
+            })
+
+        if not defaults.get("patient_initials") and self.file_label:
+            defaults["patient_initials"] = self.file_label.split("_")[0]
+
+        return defaults
+
+    def _export_full_record_for_ml(self):
+        if self.scg_df.empty:
+            QMessageBox.information(self, "No data", "Load a CSV first.")
+            return
+        if self.full_result is None:
+            QMessageBox.information(self, "No analysis", "Run full record analysis before exporting.")
+            return
+
+        trim_start = self.trim_start_spin.value()
+        trim_end = self.trim_end_spin.value()
+        scg_df = self.scg_df.copy()
+        if "time_s" not in scg_df.columns:
+            t0 = float(scg_df["timestamp_ms"].iloc[0])
+            scg_df["time_s"] = (scg_df["timestamp_ms"] - t0) / 1000.0
+
+        if trim_end > trim_start:
+            scg_df = scg_df[(scg_df["time_s"] >= trim_start) & (scg_df["time_s"] <= trim_end)].copy()
+
+        if scg_df.empty:
+            QMessageBox.warning(self, "No data", "Trim range contains no SCG samples.")
+            return
+
+        defaults = self._build_export_defaults()
+        dlg = ExportMlDialog(self, patient_id=self.file_label, existing=defaults)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        meta_fields = dlg.get_metadata()
+        meta_fields["patient_id"] = self.file_label
+        meta_fields["session_start"] = defaults.get("session_start") or datetime.now().isoformat()
+        meta_fields["sample_rate_ppg_hz"] = defaults.get("sample_rate_ppg_hz", PPG_SAMPLE_RATE)
+        meta_fields["filter_enabled"] = defaults.get("filter_enabled")
+        meta_fields["notch_50hz_enabled"] = defaults.get("notch_50hz_enabled")
+
+        ao_peaks = self.full_result.get("all_ao_peaks", np.array([], dtype=int))
+        ppg_peak_times_s = None
+        ppg_raw_series = None
+        ppg_fs = None
+        ref_fs = float(self.ppg_info.get("ref_fs", 0.0))
+        ppg_peaks_ref_trim = self.full_result.get("ppg_peaks_ref_trim", np.array([], dtype=int))
+        if ref_fs > 0 and len(ppg_peaks_ref_trim) > 0:
+            ppg_times = ppg_peaks_ref_trim.astype(float) / ref_fs
+            ppg_times = ppg_times - float(trim_start)
+            ppg_peak_times_s = ppg_times[ppg_times >= 0.0]
+
+        if not self.ppg_df.empty:
+            ppg_df = self.ppg_df.copy()
+            if "time_s" not in ppg_df.columns:
+                ppg_df["time_s"] = (ppg_df["timestamp_ms"] - float(ppg_df["timestamp_ms"].iloc[0])) / 1000.0
+            if trim_end > trim_start:
+                ppg_df = ppg_df[(ppg_df["time_s"] >= trim_start) & (ppg_df["time_s"] <= trim_end)].copy()
+            if not ppg_df.empty:
+                ppg_raw_series = ppg_df[OPTIONAL_PPG_COL].to_numpy(dtype=float)
+                _, ppg_fs = _compute_rate_from_ts(ppg_df["timestamp_ms"].to_numpy(dtype=float))
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_base = os.path.join(script_dir, ML_EXPORT_DIR)
+        try:
+            exported = export_subject_for_ml(
+                scg_df,
+                meta_fields,
+                ao_peaks,
+                self.fs_proc,
+                output_base,
+                ppg_peak_times_s=ppg_peak_times_s,
+                ppg_raw=ppg_raw_series,
+                ppg_fs=ppg_fs,
+                ppg_key="PPG_Peaks",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export failed", str(exc))
+            return
+
+        rel_csv = os.path.relpath(exported["csv_path"], script_dir)
+        self.export_ml_status.setText(f"Exported: {rel_csv}")
+        if hasattr(self, "batch_export_status"):
+            self.batch_export_status.setText("")
+        QMessageBox.information(
+            self,
+            "Export complete",
+            f"Exported CSV:\n{exported['csv_path']}\n\nMeta JSON:\n{exported['meta_path']}"
+        )
+
+    def _batch_export_for_ml(self):
+        search_dir = Path(self.search_dir_edit.text().strip() or DEFAULT_SEARCH_DIR)
+        if not search_dir.exists() or not search_dir.is_dir():
+            QMessageBox.warning(self, "Missing folder", "Workspace folder does not exist.")
+            return
+
+        min_duration = float(self.batch_min_seconds_spin.value())
+        candidates = sorted(search_dir.rglob("*.csv"))
+        if not candidates:
+            QMessageBox.information(self, "No files", "No CSV files found for batch export.")
+            return
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        output_base = os.path.join(script_dir, ML_EXPORT_DIR)
+
+        exported_paths = []
+        skipped_paths = []
+        failed_paths = []
+
+        def _load_peaks_seconds(json_path: str, key_hint: str) -> np.ndarray:
+            if not os.path.exists(json_path):
+                return np.array([], dtype=float)
+            with open(json_path, "r", encoding="utf-8") as handle:
+                payload = json.load(handle) or {}
+            times = payload.get(key_hint)
+            if times is None and payload:
+                times = next(iter(payload.values()))
+            if not times:
+                return np.array([], dtype=float)
+            return np.asarray([parse_timestamp_to_seconds(t) for t in times], dtype=float)
+
+        for path in candidates:
+            duration_s = _get_csv_duration(path)
+            if duration_s < min_duration:
+                skipped_paths.append(path)
+                continue
+
+            try:
+                raw_df = _read_csv_from_source(None, str(path))
+                df = _prepare_df(raw_df)
+            except Exception as exc:
+                failed_paths.append((path, str(exc)))
+                continue
+
+            scg_df = df[df[["x_g", "y_g", "z_g"]].notna().any(axis=1)].copy()
+            if scg_df.empty:
+                failed_paths.append((path, "No SCG samples found"))
+                continue
+
+            ppg_df = df[df[OPTIONAL_PPG_COL].notna()].copy() if OPTIONAL_PPG_COL in df.columns else pd.DataFrame()
+            scg_start_ts = float(scg_df["timestamp_ms"].iloc[0])
+            scg_end_ts = float(scg_df["timestamp_ms"].iloc[-1])
+            if not ppg_df.empty:
+                ppg_df = ppg_df[(ppg_df["timestamp_ms"] >= scg_start_ts) & (ppg_df["timestamp_ms"] <= scg_end_ts)].copy()
+
+            meta, _ = _read_metadata_for_csv(str(path))
+            meta = meta or {}
+
+            patient_id = path.stem
+            meta_fields = {
+                "patient_id": patient_id,
+                "patient_initials": meta.get("patient_initials") or patient_id.split("_")[0],
+                "age": meta.get("age"),
+                "sex": meta.get("sex"),
+                "weight_kg": meta.get("weight_kg"),
+                "height_cm": meta.get("height_cm"),
+                "bmi": meta.get("bmi"),
+                "cardiac_conditions": meta.get("cardiac_conditions") or ["Normal"],
+                "notes": meta.get("notes", ""),
+                "session_start": meta.get("session_start") or datetime.now().isoformat(),
+                "sample_rate_ppg_hz": meta.get("sample_rate_ppg_hz", PPG_SAMPLE_RATE),
+                "filter_enabled": meta.get("filter_enabled"),
+                "notch_50hz_enabled": meta.get("notch_50hz_enabled"),
+            }
+
+            fs_hint = meta.get("sample_rate_scg_hz") or 0
+            if not fs_hint:
+                _, inferred_fs = _compute_rate_from_ts(scg_df["timestamp_ms"].to_numpy(dtype=float))
+                fs_hint = inferred_fs if inferred_fs > 0 else ML_TARGET_FS
+
+            ppg_peak_times_s = np.array([], dtype=float)
+            ppg_raw_series = None
+            ppg_fs = None
+            if not ppg_df.empty:
+                ppg_info = _current_ppg_info(
+                    ppg_df,
+                    beat_times_s=np.array([], dtype=float),
+                    beat_source="Detect from PPG raw",
+                    ppg_bp_low=self.ppg_bp_low_spin.value(),
+                    ppg_bp_high=self.ppg_bp_high_spin.value(),
+                    ppg_max_bpm=self.ppg_max_bpm_spin.value(),
+                    ppg_prom=self.ppg_prom_spin.value(),
+                    fs_proc=float(fs_hint),
+                )
+                ppg_peak_times_s = ppg_info.get("ppg_peak_times_s", np.array([], dtype=float))
+                ppg_ts0 = float(ppg_df["timestamp_ms"].iloc[0])
+                offset_s = (ppg_ts0 - scg_start_ts) / 1000.0
+                if ppg_peak_times_s.size > 0:
+                    ppg_peak_times_s = ppg_peak_times_s + offset_s
+
+                ppg_raw_series = ppg_df[OPTIONAL_PPG_COL].to_numpy(dtype=float)
+                _, ppg_fs = _compute_rate_from_ts(ppg_df["timestamp_ms"].to_numpy(dtype=float))
+
+                ao_json_path = os.path.join("Saved_Peaks", f"{patient_id}_AO_Peaks.json")
+                ao_key = f"{patient_id}_AO_Peaks"
+                ao_seconds = _load_peaks_seconds(ao_json_path, ao_key)
+                if ao_seconds.size > 1 and ppg_peak_times_s.size > 1:
+                    ao_idx = np.round(ao_seconds * float(fs_hint)).astype(int)
+                    ref_fs = float(ppg_info.get("ref_fs", 0.0))
+                    ppg_idx = np.round(ppg_peak_times_s * ref_fs).astype(int) if ref_fs > 0 else np.array([], dtype=int)
+                    if ppg_idx.size > 1 and ref_fs > 0:
+                        ptt_seconds, _seg = _calculate_high_corr_ptt(ao_idx, ppg_idx, float(fs_hint), ref_fs)
+                        if ptt_seconds > 0:
+                            ppg_peak_times_s = ppg_peak_times_s - float(ptt_seconds)
+                            ppg_peak_times_s = ppg_peak_times_s[ppg_peak_times_s >= 0.0]
+
+            try:
+                exported = export_subject_for_ml(
+                    scg_df,
+                    meta_fields,
+                    np.array([], dtype=int),
+                    fs_hint,
+                    output_base,
+                    ppg_peak_times_s=ppg_peak_times_s,
+                    ppg_raw=ppg_raw_series,
+                    ppg_fs=ppg_fs,
+                    ppg_key="PPG_Peaks",
+                )
+                exported_paths.append(exported["csv_path"])
+            except Exception as exc:
+                failed_paths.append((path, str(exc)))
+
+        if hasattr(self, "batch_export_status"):
+            self.batch_export_status.setText(f"Batch exported: {len(exported_paths)}")
+        self.export_ml_status.setText("")
+
+        summary = (
+            f"Exported: {len(exported_paths)}\n"
+            f"Skipped (duration < {min_duration:.1f}s): {len(skipped_paths)}\n"
+            f"Failed: {len(failed_paths)}"
+        )
+        QMessageBox.information(self, "Batch export complete", summary)
 
     def _render_window_result(self, result: dict):
         self.window_overlay_plot.clear()
