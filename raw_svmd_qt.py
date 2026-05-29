@@ -1453,8 +1453,106 @@ def _match_peaks_by_lag(detected_peaks, reference_peaks, fs_ao, fs_ref, toleranc
         used[closest_idx] = True
         matched_detected.append(int(closest_idx))
         matched_reference.append(int(ref_idx))
-
     return matched_detected, matched_reference
+
+
+def _calculate_high_corr_ptt(ao_peaks, ppg_peaks, fs_ao, fs_ref, window_secs=15.0):
+    """Scan sliding windows to find the segment with the highest AO-AO vs PPG-PPG
+    interval correlation. Both peak arrays are converted to seconds internally.
+    Returns (ptt_seconds, best_segment_info) where best_segment_info has keys
+    't_start', 't_end', 'corr' in absolute time, or None if no valid window found."""
+    ao_peaks = np.asarray(ao_peaks, dtype=float)
+    ppg_peaks = np.asarray(ppg_peaks, dtype=float)
+    if ao_peaks.size < 2 or ppg_peaks.size < 2:
+        return 0.0, None
+
+    ao_s = np.sort(ao_peaks) / float(fs_ao)
+    ppg_s = np.sort(ppg_peaks) / float(fs_ref)
+
+    # Global PTT fallback: exclusive nearest-preceding-AO-peak lag across all data
+    global_lags = []
+    used_ao_g = np.zeros(len(ao_s), dtype=bool)
+    for p in ppg_s:
+        diffs = p - ao_s
+        valid = np.where((diffs >= 0.05) & (diffs <= 0.60) & ~used_ao_g)[0]
+        if len(valid) > 0:
+            chosen = valid[np.argmin(diffs[valid])]
+            global_lags.append(diffs[chosen])
+            used_ao_g[chosen] = True
+    global_ptt = float(np.median(global_lags)) if len(global_lags) >= 2 else 0.2
+
+    total_duration = max(ao_s[-1], ppg_s[-1]) if ao_s.size > 0 and ppg_s.size > 0 else 0.0
+    data_start = min(ao_s[0], ppg_s[0])        # start windows at first available data
+    step_secs = 2.0
+
+    best_corr = -1.0
+    best_ptt = global_ptt
+    best_t_start = None
+    best_t_end = None
+
+    t_start = data_start
+    while t_start + window_secs <= total_duration:
+        t_end = t_start + window_secs
+
+        win_ao = ao_s[(ao_s >= t_start) & (ao_s < t_end)]
+        win_ppg = ppg_s[(ppg_s >= t_start) & (ppg_s < t_end)]
+
+        if len(win_ao) >= 6 and len(win_ppg) >= 6:
+            # Beat-to-beat intervals (ms) and their midpoint times (s)
+            ao_ivals = np.diff(win_ao) * 1000.0
+            ppg_ivals = np.diff(win_ppg) * 1000.0
+            ao_centers = (win_ao[:-1] + win_ao[1:]) / 2.0
+            ppg_centers = (win_ppg[:-1] + win_ppg[1:]) / 2.0
+
+            # Match each PPG interval to the nearest unmatched AO interval by center time.
+            # Since both signals have the same heart rate, centres should be within
+            # half an RR interval of each other.
+            median_rr = float(np.median(ppg_ivals)) / 1000.0
+            max_dt = min(0.55 * median_rr, 0.6) if median_rr > 0 else 0.6
+
+            matched_ao_iv = []
+            matched_ppg_iv = []
+            used_ao = np.zeros(len(ao_centers), dtype=bool)
+            for pi in range(len(ppg_centers)):
+                dists = np.abs(ao_centers - ppg_centers[pi])
+                dists[used_ao] = np.inf
+                best_i = int(np.argmin(dists))
+                if dists[best_i] <= max_dt:
+                    matched_ao_iv.append(ao_ivals[best_i])
+                    matched_ppg_iv.append(ppg_ivals[pi])
+                    used_ao[best_i] = True
+
+            if len(matched_ao_iv) >= 5:
+                mao = np.array(matched_ao_iv)
+                mppg = np.array(matched_ppg_iv)
+                # Guard: skip windows where variance is too low (would give trivial r=1)
+                if np.std(mao) > 1.5 and np.std(mppg) > 1.5:
+                    corr = np.corrcoef(mao, mppg)[0, 1]
+                    if np.isfinite(corr) and corr > best_corr:
+                        best_corr = corr
+                        # PTT: exclusive nearest-preceding-AO-peak lag, median
+                        lags = []
+                        used_ao_pk = np.zeros(len(win_ao), dtype=bool)
+                        for p in win_ppg:
+                            diffs = p - win_ao
+                            valid = np.where((diffs >= 0.05) & (diffs <= 0.60) & ~used_ao_pk)[0]
+                            if len(valid) > 0:
+                                chosen = valid[np.argmin(diffs[valid])]
+                                lags.append(diffs[chosen])
+                                used_ao_pk[chosen] = True
+                        if len(lags) >= 2:
+                            best_ptt = float(np.median(lags))
+                        best_t_start = t_start
+                        best_t_end = t_end
+
+        t_start += step_secs
+
+    if best_corr >= 0.60 and best_t_start is not None:
+        segment_info = {"t_start": best_t_start, "t_end": best_t_end, "corr": best_corr}
+        return best_ptt, segment_info
+
+    # Fall back to global PTT — no best segment to highlight
+    return global_ptt, None
 
 
 def compute_ptt_metrics(ao_peaks, ppg_peaks, fs_ao, fs_ref, tolerance_seconds=0.15):
@@ -1580,7 +1678,7 @@ def compute_paper_metrics(ao_intervals_ms, ref_intervals_ms):
     }
 
 
-def compute_detection_metrics(detected_peaks, reference_peaks, fs_ao, fs_ref, tolerance_seconds=0.15):
+def compute_detection_metrics(detected_peaks, reference_peaks, fs_ao, fs_ref, tolerance_seconds=0.15, already_aligned=False):
     detected = np.asarray(detected_peaks, dtype=float)
     reference = np.asarray(reference_peaks, dtype=float)
     if len(reference) == 0:
@@ -1590,7 +1688,10 @@ def compute_detection_metrics(detected_peaks, reference_peaks, fs_ao, fs_ref, to
     reference = np.sort(reference)
     detected_s = detected / float(fs_ao)
     reference_s = reference / float(fs_ref)
-    lag_seconds = _estimate_peak_lag_samples(detected, reference, fs_ao, fs_ref)
+    if already_aligned:
+        lag_seconds = 0.0
+    else:
+        lag_seconds = _estimate_peak_lag_samples(detected, reference, fs_ao, fs_ref)
     window_min, window_max = _ptt_window_samples(lag_seconds, tolerance_seconds)
 
     used = np.zeros(len(detected_s), dtype=bool)
@@ -1755,9 +1856,31 @@ def run_window_analysis(inputs: dict) -> dict:
     ppg_peaks_window = ppg_peaks_full[(ppg_peaks_full >= start_idx) & (ppg_peaks_full < end_idx)] - start_idx
     peaks_abs = peaks + start_idx
 
+    # Find PTT based on the highly correlated segment if enabled
+    shift_ppg_align = bool(inputs.get("shift_ppg_align", True))
+    if shift_ppg_align:
+        ptt_seconds, _seg = _calculate_high_corr_ptt(peaks_abs, ppg_peaks_window_ref, fs_proc, float(inputs["ref_fs"]), window_secs=min(15.0, window_size))
+    else:
+        ptt_seconds = 0.0
+    
+    # Store original unshifted peaks for physiological PTT computation
+    original_ppg_window_ref = ppg_peaks_window_ref.copy()
+    
+    # Shift PPG peaks backward by PTT to align with SCG AO peaks
+    ppg_peaks_window_ref = ppg_peaks_window_ref - int(ptt_seconds * float(inputs["ref_fs"]))
+    ppg_peaks_window = ppg_peaks_window - int(ptt_seconds * fs_proc)
+    
+    # Filter out any peaks that become negative after shifting
+    valid_ref_mask = ppg_peaks_window_ref >= 0
+    ppg_peaks_window_ref = ppg_peaks_window_ref[valid_ref_mask]
+    original_ppg_window_ref = original_ppg_window_ref[valid_ref_mask]
+    
+    valid_full_mask = ppg_peaks_window >= 0
+    ppg_peaks_window = ppg_peaks_window[valid_full_mask]
+
     detection_metrics_window = None
     if len(peaks_abs) > 0 and len(ppg_peaks_window_ref) > 0:
-        detection_metrics_window = compute_detection_metrics(peaks_abs, ppg_peaks_window_ref, fs_proc, float(inputs["ref_fs"]), tolerance_seconds=0.2)
+        detection_metrics_window = compute_detection_metrics(peaks_abs, ppg_peaks_window_ref, fs_proc, float(inputs["ref_fs"]), tolerance_seconds=0.2, already_aligned=shift_ppg_align)
 
     comparison = None
     iqr_removed_ao_centers_s = np.array([])
@@ -1787,7 +1910,7 @@ def run_window_analysis(inputs: dict) -> dict:
                 "mean_intervals": (ao_intervals_ms + ppg_intervals_ms) / 2,
                 "diff_intervals": ao_intervals_ms - ppg_intervals_ms,
                 "paper_metrics": compute_paper_metrics(ao_intervals_ms, ppg_intervals_ms),
-                "ptt_metrics": compute_ptt_metrics(peaks_abs, ppg_peaks_window_ref, fs_proc, float(inputs["ref_fs"])),
+                "ptt_metrics": compute_ptt_metrics(peaks_abs, original_ppg_window_ref, fs_proc, float(inputs["ref_fs"])),
             }
 
     return {
@@ -1928,6 +2051,31 @@ def run_full_record_analysis(inputs: dict, progress_callback=None, status_callba
             saved_file_ppg = save_peaks_seconds_to_json(ppg_peak_times, file_label, output_folder, peak_label="PPG")
             save_messages.append(f"PPG Peaks saved to: {saved_file_ppg}")
 
+    # Calculate PTT using the high-correlation segment scanner if enabled
+    shift_ppg_align = bool(inputs.get("shift_ppg_align", True))
+    ptt_best_segment = None
+    if shift_ppg_align:
+        ptt_seconds, ptt_best_segment = _calculate_high_corr_ptt(all_ao_peaks + start_idx_global, ppg_peaks_ref_trim, fs_proc, float(inputs["ref_fs"]))
+    else:
+        ptt_seconds = 0.0
+    
+    # Store original unshifted peaks for physiological PTT computation and rendering comparison
+    original_ppg_peaks_ref_trim = ppg_peaks_ref_trim.copy()
+    original_ppg_peaks_full_trim = ppg_peaks_full_trim.copy()
+    
+    # Shift PPG peaks backward by PTT to align with SCG AO peaks
+    ppg_peaks_ref_trim = ppg_peaks_ref_trim - int(ptt_seconds * float(inputs["ref_fs"]))
+    ppg_peaks_full_trim = ppg_peaks_full_trim - int(ptt_seconds * fs_proc)
+    
+    # Filter out any peaks that become negative or out of bounds after shifting
+    valid_ref_mask = ppg_peaks_ref_trim >= 0
+    ppg_peaks_ref_trim = ppg_peaks_ref_trim[valid_ref_mask]
+    original_ppg_peaks_ref_trim = original_ppg_peaks_ref_trim[valid_ref_mask]
+    
+    valid_full_mask = (ppg_peaks_full_trim >= 0) & (ppg_peaks_full_trim < len(scg_proc_trim))
+    ppg_peaks_full_trim = ppg_peaks_full_trim[valid_full_mask]
+    original_ppg_peaks_full_trim = original_ppg_peaks_full_trim[valid_full_mask]
+
     ppg_intervals_full = np.diff(ppg_peaks_full_trim) / fs_proc * 1000.0 if len(ppg_peaks_full_trim) > 1 else np.array([])
     ppg_interval_times_full = (
         (ppg_peaks_full_trim[:-1] + ppg_peaks_full_trim[1:]) / 2.0 / fs_proc + trim_start if len(ppg_peaks_full_trim) > 1 else np.array([])
@@ -1935,7 +2083,7 @@ def run_full_record_analysis(inputs: dict, progress_callback=None, status_callba
 
     detection_metrics_full = None
     if len(all_ao_peaks) > 0 and len(ppg_peaks_ref_trim) > 0:
-        detection_metrics_full = compute_detection_metrics(all_ao_peaks + start_idx_global, ppg_peaks_ref_trim, fs_proc, float(inputs["ref_fs"]), tolerance_seconds=0.2)
+        detection_metrics_full = compute_detection_metrics(all_ao_peaks + start_idx_global, ppg_peaks_ref_trim, fs_proc, float(inputs["ref_fs"]), tolerance_seconds=0.2, already_aligned=shift_ppg_align)
 
     ao_intervals_matched = np.array([])
     ppg_intervals_matched = np.array([])
@@ -1971,7 +2119,7 @@ def run_full_record_analysis(inputs: dict, progress_callback=None, status_callba
         mean_diff = np.mean(diff_intervals)
         std_diff = np.std(diff_intervals)
         paper_metrics = compute_paper_metrics(ao_intervals_matched, ppg_intervals_matched)
-        ptt_metrics = compute_ptt_metrics(all_ao_peaks + start_idx_global, ppg_peaks_ref_trim, fs_proc, float(inputs["ref_fs"]))
+        ptt_metrics = compute_ptt_metrics(all_ao_peaks + start_idx_global, original_ppg_peaks_ref_trim, fs_proc, float(inputs["ref_fs"]))
 
     full_time_axis = np.arange(len(scg_proc_trim)) / fs_proc + trim_start if fs_proc > 0 else np.array([])
     if len(scg_raw_trim) == len(scg_proc_trim):
@@ -1992,7 +2140,10 @@ def run_full_record_analysis(inputs: dict, progress_callback=None, status_callba
         "ppg_intervals_full": ppg_intervals_full,
         "ppg_interval_times_full": ppg_interval_times_full,
         "ppg_peaks_full_trim": ppg_peaks_full_trim,
+        "original_ppg_peaks_full_trim": original_ppg_peaks_full_trim,
         "ppg_peaks_ref_trim": ppg_peaks_ref_trim,
+        "ptt_seconds": ptt_seconds,
+        "ptt_best_segment": ptt_best_segment,
         "sample_bad_mask_full_record": sample_bad_mask_full_record,
         "sqa_result_full_record": sqa_result_full_record,
         "detection_metrics_full": detection_metrics_full,
@@ -2415,6 +2566,8 @@ class RawScgSvmdWindow(QMainWindow):
         self.ppg_prom_spin = QDoubleSpinBox(); self.ppg_prom_spin.setRange(0.0, 1.0); self.ppg_prom_spin.setValue(0.3); self.ppg_prom_spin.setSingleStep(0.01)
         self.save_json_check = QCheckBox("Save AO Peaks to JSON")
         self.save_ppg_json_check = QCheckBox("Save PPG Peaks to JSON")
+        self.shift_ppg_check = QCheckBox("Shift PPG peaks (PTT alignment)")
+        self.shift_ppg_check.setChecked(True)
         self.output_folder_edit = QLineEdit("Saved_Peaks")
         for label, widget in [
             ("SVMD alpha", self.svmd_alpha_spin),
@@ -2427,6 +2580,7 @@ class RawScgSvmdWindow(QMainWindow):
             ("PPG peak prominence factor", self.ppg_prom_spin),
             ("Save AO JSON", self.save_json_check),
             ("Save PPG JSON", self.save_ppg_json_check),
+            ("Shift PPG to SCG", self.shift_ppg_check),
             ("Output folder", self.output_folder_edit),
         ]:
             svmd_form.addRow(label, widget)
@@ -2543,11 +2697,12 @@ class RawScgSvmdWindow(QMainWindow):
         self.full_interval_plot = MplPlotWidget("PPG-PPG and AO-AO Intervals", width=11, height=4.0, dpi=100, sharex=self.full_raw_plot.axes)
         self.full_ba_plot = MplPlotWidget("Bland-Altman Plot", width=11, height=4.0, dpi=100)
         self.full_corr_plot = MplPlotWidget("AO-AO vs PPG-PPG Intervals", width=11, height=4.0, dpi=100)
+        self.full_shift_plot = MplPlotWidget("PPG Peak Shift Alignment (Before vs After)", width=11, height=4.0, dpi=100)
         self.full_metrics_table = QTableWidget(); self.full_metrics_table.setMinimumHeight(170)
         self.detect_metrics_table = QTableWidget(); self.detect_metrics_table.setMinimumHeight(170)
         self.detection_errors_table = QTableWidget(); self.detection_errors_table.setMinimumHeight(170)
         self.iqr_table = QTableWidget(); self.iqr_table.setMinimumHeight(150)
-        for plot in [self.full_raw_plot, self.full_proc_plot, self.full_ppg_plot, self.full_interval_plot, self.full_ba_plot, self.full_corr_plot]:
+        for plot in [self.full_raw_plot, self.full_proc_plot, self.full_ppg_plot, self.full_interval_plot, self.full_ba_plot, self.full_corr_plot, self.full_shift_plot]:
             self.full_layout.addWidget(plot)
         self.full_layout.addWidget(QLabel("Interval Metrics"))
         self.full_layout.addWidget(self.full_metrics_table)
@@ -3141,6 +3296,7 @@ class RawScgSvmdWindow(QMainWindow):
             "ppg_max_bpm": self.ppg_max_bpm_spin.value(),
             "ppg_prom": self.ppg_prom_spin.value(),
             "fs_proc": float(self.target_fs_spin.value()),
+            "shift_ppg_align": self.shift_ppg_check.isChecked(),
         }
 
     def _build_processing_state(self):
@@ -3368,13 +3524,14 @@ class RawScgSvmdWindow(QMainWindow):
         self._populate_key_value_table(self.window_metrics_table, rows)
 
     def _render_full_result(self, result: dict):
-        for plot in [self.full_raw_plot, self.full_proc_plot, self.full_ppg_plot, self.full_interval_plot, self.full_ba_plot, self.full_corr_plot]:
+        for plot in [self.full_raw_plot, self.full_proc_plot, self.full_ppg_plot, self.full_interval_plot, self.full_ba_plot, self.full_corr_plot, self.full_shift_plot]:
             plot.clear()
 
         full_time_axis = result.get("full_time_axis", np.array([]))
         scg_raw_display = result.get("scg_raw_display", np.array([]))
         scg_proc_trim = result.get("scg_proc_trim", np.array([]))
         ppg_peaks_full_trim = result.get("ppg_peaks_full_trim", np.array([], dtype=int))
+        original_ppg_peaks_full_trim = result.get("original_ppg_peaks_full_trim", np.array([], dtype=int))
         ppg_intervals_full = result.get("ppg_intervals_full", np.array([]))
         ppg_interval_times_full = result.get("ppg_interval_times_full", np.array([]))
         all_ao_peaks = result.get("all_ao_peaks", np.array([], dtype=int))
@@ -3428,10 +3585,26 @@ class RawScgSvmdWindow(QMainWindow):
         self.full_ppg_plot.draw()
 
         ax = self.full_interval_plot.axes
+        ptt_best_segment = result.get("ptt_best_segment")  # dict with t_start, t_end, corr
         if len(ppg_interval_times_full) > 0:
             ax.plot(ppg_interval_times_full, ppg_intervals_full, color="green", linewidth=1.2, marker="o", markersize=3, label="PPG-PPG")
         if len(all_ao_intervals_times) > 0:
             ax.plot(all_ao_intervals_times, all_ao_intervals, color="red", linewidth=1.2, marker="o", markersize=3, label="AO-AO")
+        # Highlight the best-correlation segment used to determine PTT
+        if ptt_best_segment is not None:
+            seg_t0 = ptt_best_segment["t_start"]   # already in absolute time
+            seg_t1 = ptt_best_segment["t_end"]
+            seg_corr = ptt_best_segment["corr"]
+            ax.axvspan(seg_t0, seg_t1, alpha=0.15, color="#f9ca24", zorder=0, label=f"PTT Segment (r={seg_corr:.3f})")
+            ax.axvline(seg_t0, color="#e67e22", linewidth=1.2, linestyle="--", zorder=1)
+            ax.axvline(seg_t1, color="#e67e22", linewidth=1.2, linestyle="--", zorder=1)
+            ax.text(
+                (seg_t0 + seg_t1) / 2, 0.98,
+                f"r={seg_corr:.3f}",
+                ha="center", va="top", fontsize=8, color="#e67e22", fontweight="bold",
+                bbox=dict(boxstyle="round,pad=0.2", facecolor="#fff9e6", edgecolor="#f9ca24", alpha=0.9),
+                transform=ax.get_xaxis_transform(),
+            )
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Interval (ms)")
         ax.grid(True, alpha=0.25)
@@ -3472,12 +3645,55 @@ class RawScgSvmdWindow(QMainWindow):
                 ax.legend(loc="best")
                 self.full_corr_plot.draw()
 
+        # Render the PPG peak shift alignment plot (Before vs After)
+        ptt_seconds = result.get("ptt_seconds", 0.0)
+        ptt_ms = ptt_seconds * 1000.0
+        shift_ppg_align = bool(ptt_seconds > 0.0)
+        
+        ax = self.full_shift_plot.axes
+        if len(scg_proc_trim) > 0 and len(full_time_axis) == len(scg_proc_trim):
+            # Plot the entire SCG signal in neutral grey
+            ax.plot(full_time_axis, scg_proc_trim, color="#7f8c8d", linewidth=1.0, label="SCG Signal")
+            
+            # Draw original PPG peaks as vertical red lines
+            if len(original_ppg_peaks_full_trim) > 0:
+                valid_orig_idx = original_ppg_peaks_full_trim[original_ppg_peaks_full_trim < len(scg_proc_trim)]
+                _first = True
+                for idx in valid_orig_idx:
+                    ax.axvline(full_time_axis[idx], color="#ff4757", linewidth=0.8, linestyle="-",
+                               alpha=0.7, label="Original PPG Peaks" if _first else "", zorder=2)
+                    _first = False
+            
+            # Draw shifted PPG peaks as vertical green solid lines
+            if shift_ppg_align and ptt_seconds > 0.0 and len(ppg_peaks_full_trim) > 0:
+                valid_shift_idx = ppg_peaks_full_trim[ppg_peaks_full_trim < len(scg_proc_trim)]
+                _first = True
+                for idx in valid_shift_idx:
+                    ax.axvline(full_time_axis[idx], color="#2ed573", linewidth=0.8, linestyle="-",
+                               alpha=0.7, label="Shifted PPG Peaks" if _first else "", zorder=3)
+                    _first = False
+            
+            if shift_ppg_align and ptt_seconds > 0.0:
+                ax.set_title(f"PPG Peak Shift Alignment (Shifted by {ptt_ms:.1f} ms)", fontsize=9)
+            else:
+                ax.set_title("PPG Peak Shift Alignment (No Shift Applied)", fontsize=9)
+                    
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("SCG Amplitude")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="upper right")
+        self.full_shift_plot.draw()
+
         self._fill_full_tables(result, detection_metrics_full)
 
     def _fill_full_tables(self, result: dict, detection_metrics_full: dict):
         paper_metrics = result.get("paper_metrics") or {}
         ptt_metrics = result.get("ptt_metrics") or {}
         interval_rows = []
+        
+        ptt_seconds = result.get("ptt_seconds", 0.0)
+        interval_rows.append(("PTT Shift Alignment (ms)", ptt_seconds * 1000.0))
+        
         for key in ["correlation", "rmse", "mae", "mean_diff", "std_diff"]:
             if key in result:
                 interval_rows.append((key, result.get(key)))
@@ -3502,7 +3718,9 @@ class RawScgSvmdWindow(QMainWindow):
             if len(fn_times) > 0:
                 detect_df = pd.concat([detect_df, pd.DataFrame({"type": ["FN"] * len(fn_times), "sample_idx": fn_peaks, "time_s": fn_times})], ignore_index=True)
             self._fill_table(self.detection_errors_table, detect_df)
-            return
+        else:
+            self.detect_metrics_table.clear()
+            self.detection_errors_table.clear()
 
         ao_removed = result.get("iqr_removed_ao_centers_s", np.array([]))
         ppg_removed = result.get("iqr_removed_ppg_centers_s", np.array([]))
@@ -3514,7 +3732,6 @@ class RawScgSvmdWindow(QMainWindow):
             self._fill_table(self.iqr_table, df)
         else:
             self.iqr_table.clear()
-            self.detection_errors_table.clear()
 
     def _populate_key_value_table(self, table: QTableWidget, rows):
         table.clear()
