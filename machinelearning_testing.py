@@ -42,7 +42,7 @@ class HVDNetDataLoader:
     def __init__(self, data_dir="Data"):
         self.data_dir = data_dir
         self.saved_peaks_dir = "Saved_Peaks"
-        self.subject_data_dir = "SUBJECT_Data"
+        self.subject_data_dir = "Subject_Data_Segmented"
         self.target_fs = 256  # The paper standardizes to 256 Hz 
         self.label_columns = [
             "Moderate or greater MS",
@@ -52,12 +52,9 @@ class HVDNetDataLoader:
             "Moderate or greater TR",
         ]
         self.label_to_index = {name: idx for idx, name in enumerate(self.label_columns)}
+        # Only AS+MR+Normal classification is supported.
         self.task_class_names = {
-            "Task I": ["AS", "MR", "MS", "AR", "N"],
-            "Task I (MS+AR)": ["AS", "MR", "MS+AR (Others)"],
             "Task I (AS+MR)": ["AS", "MR", "N"],
-            "Task II": ["AS", "AS-MR", "AS-MS", "AS-AR", "AS-TR"],
-            "Task III": ["MS", "MR", "AR", "AS", "TR"],
         }
 
     def get_original_fs(self, patient_id):
@@ -76,62 +73,31 @@ class HVDNetDataLoader:
         h, m, s = time_str.split(':')
         return int(h) * 3600 + int(m) * 60 + float(s)
 
-    def _list_subject_csv_paths(self):
+    def _list_segmented_csv_paths(self):
         pattern = os.path.join(self.subject_data_dir, "**", "*.csv")
         return sorted(glob.glob(pattern, recursive=True))
 
-    def _find_subject_csv_path(self, patient_id):
-        for path in self._list_subject_csv_paths():
-            if os.path.splitext(os.path.basename(path))[0] == patient_id:
-                return path
-        return None
+    def _find_segmented_csv_path(self, patient_id):
+        pattern = os.path.join(self.subject_data_dir, "**", f"{patient_id}.csv")
+        matches = sorted(glob.glob(pattern, recursive=True))
+        return matches[0] if matches else None
 
-    def load_subject_metadata(self, csv_path):
-        meta_path = os.path.splitext(csv_path)[0] + "_meta.json"
-        if os.path.exists(meta_path):
+    def _find_segmented_meta_path(self, patient_id):
+        pattern = os.path.join(self.subject_data_dir, "**", f"{patient_id}_meta.json")
+        matches = sorted(glob.glob(pattern, recursive=True))
+        return matches[0] if matches else None
+
+    def _find_segmented_ppg_json_path(self, patient_id):
+        pattern = os.path.join(self.subject_data_dir, "**", f"{patient_id}-PPG.json")
+        matches = sorted(glob.glob(pattern, recursive=True))
+        return matches[0] if matches else None
+
+    def load_segmented_metadata(self, patient_id):
+        meta_path = self._find_segmented_meta_path(patient_id)
+        if meta_path and os.path.exists(meta_path):
             with open(meta_path, "r", encoding="utf-8") as f:
                 return json.load(f)
-
-        meta = {}
-        try:
-            with open(csv_path, "r", encoding="utf-8") as f:
-                for line in f:
-                    if not line.startswith("#"):
-                        break
-                    stripped = line.lstrip("#").strip()
-                    if not stripped:
-                        continue
-                    if "," in stripped:
-                        key, value = stripped.split(",", 1)
-                        meta[key.strip()] = value.strip()
-        except FileNotFoundError:
-            return meta
-
-        for key in ("age", "sample_rate_scg_hz", "sample_rate_ppg_hz"):
-            if key in meta:
-                try:
-                    meta[key] = int(float(meta[key]))
-                except ValueError:
-                    pass
-        for key in ("weight_kg", "height_cm", "bmi"):
-            if key in meta:
-                try:
-                    meta[key] = float(meta[key])
-                except ValueError:
-                    pass
-
-        conditions = meta.get("cardiac_conditions")
-        if isinstance(conditions, str):
-            parts = [p.strip() for p in conditions.replace("|", ";").split(";")]
-            expanded = []
-            for part in parts:
-                if "," in part:
-                    expanded.extend([p.strip() for p in part.split(",")])
-                elif part:
-                    expanded.append(part)
-            meta["cardiac_conditions"] = [p for p in expanded if p]
-
-        return meta
+        return {}
 
     def build_label_row_from_metadata(self, patient_id, meta):
         label_row = {"Patient ID": patient_id}
@@ -169,12 +135,11 @@ class HVDNetDataLoader:
             df_labels = pd.read_csv(labels_path, sep=",")
             df_labels.columns = df_labels.columns.str.strip()
             label_lookup = {row["Patient ID"]: row.to_dict() for _, row in df_labels.iterrows()}
-
-        for csv_path in self._list_subject_csv_paths():
+        for csv_path in self._list_segmented_csv_paths():
             patient_id = os.path.splitext(os.path.basename(csv_path))[0]
-            meta = self.load_subject_metadata(csv_path)
-            label_lookup[patient_id] = self.build_label_row_from_metadata(patient_id, meta)
-
+            meta = self.load_segmented_metadata(patient_id)
+            if meta:
+                label_lookup[patient_id] = self.build_label_row_from_metadata(patient_id, meta)
         return label_lookup
 
     def list_available_patients(self):
@@ -183,27 +148,43 @@ class HVDNetDataLoader:
             os.path.basename(path).replace("Cleaned_", "").replace(".csv", "")
             for path in cleaned_paths
         ]
-        subject_ids = [
+        segmented_ids = [
             os.path.splitext(os.path.basename(path))[0]
-            for path in self._list_subject_csv_paths()
+            for path in self._list_segmented_csv_paths()
         ]
-        return sorted(set(cleaned_ids + subject_ids))
+        return sorted(set(cleaned_ids + segmented_ids))
 
     def load_annotation_peaks(self, patient_id, annotation_source, signal_length):
         annotation_source = (annotation_source or "ECG").upper()
+        resolved_source = annotation_source
 
         if annotation_source == "AO":
             json_path = os.path.join(self.saved_peaks_dir, f"{patient_id}_AO_Peaks.json")
             key_name = f"{patient_id}_AO_Peaks"
             peak_plot_axis = 'AccZ'
             peak_label = 'AO-peaks'
+        elif annotation_source == "PPG":
+            json_path = self._find_segmented_ppg_json_path(patient_id)
+            key_name = 'PPG_Peaks'
+            peak_plot_axis = 'AccZ'
+            peak_label = 'PPG-peaks'
         else:
-            json_path = f"{self.data_dir}{patient_id}-ECG.json"
+            json_path = os.path.join(self.data_dir, f"{patient_id}-ECG.json")
             key_name = 'LARA_R_Peaks'
             peak_plot_axis = 'ECG'
             peak_label = 'R-peaks'
+            if not os.path.exists(json_path):
+                fallback_ppg = self._find_segmented_ppg_json_path(patient_id)
+                if fallback_ppg:
+                    json_path = fallback_ppg
+                    key_name = 'PPG_Peaks'
+                    peak_plot_axis = 'AccZ'
+                    peak_label = 'PPG-peaks'
+                    resolved_source = "PPG"
 
         try:
+            if not json_path:
+                raise FileNotFoundError(f"Missing peak JSON for {annotation_source} ({patient_id})")
             with open(json_path, 'r') as f:
                 peak_data = json.load(f)
 
@@ -220,22 +201,24 @@ class HVDNetDataLoader:
 
             return {
                 'peak_indices': peak_indices,
-                'peak_source': annotation_source,
+                'peak_source': resolved_source,
                 'peak_plot_axis': peak_plot_axis,
                 'peak_label': peak_label,
             }
         except Exception as e:
             raise Exception(f"Failed to load {annotation_source} peaks JSON: {str(e)}")
 
-    def load_patient_data(self, patient_id, annotation_source="ECG"):
+    def load_patient_data(self, patient_id, annotation_source="AUTO"):
         """Loads SCG, ECG, selected peaks annotation, and Ground Truth for a given patient."""
         results = {}
+        data_source = None
         
         cleaned_path = os.path.join(self.data_dir, f"Cleaned_{patient_id}.csv")
         if not os.path.exists(cleaned_path):
             cleaned_path = f"{self.data_dir}Cleaned_{patient_id}.csv"
 
         if os.path.exists(cleaned_path):
+            data_source = "cleaned"
             try:
                 df_signals = pd.read_csv(cleaned_path, sep=r',')
                 original_fs = self.get_original_fs(patient_id)
@@ -263,44 +246,55 @@ class HVDNetDataLoader:
             except Exception as e:
                 raise Exception(f"Failed to load signal CSV: {str(e)}")
         else:
-            subject_csv = self._find_subject_csv_path(patient_id)
-            if subject_csv is None:
-                raise FileNotFoundError(f"Missing patient CSV for {patient_id}")
+            segmented_csv = self._find_segmented_csv_path(patient_id)
+            if segmented_csv is None:
+                raise FileNotFoundError(
+                    f"Missing patient CSV for {patient_id} in {self.data_dir} or {self.subject_data_dir}"
+                )
+            data_source = "segmented"
             try:
-                df_signals = pd.read_csv(subject_csv, comment="#")
-                meta = self.load_subject_metadata(subject_csv)
-                original_fs = int(meta.get("sample_rate_scg_hz", self.target_fs))
+                df_signals = pd.read_csv(segmented_csv, comment="#")
+                meta = self.load_segmented_metadata(patient_id)
+                original_scg_fs = int(meta.get("sample_rate_scg_hz", self.target_fs))
+                # NOTE: The CSV writer interpolates PPG to match the SCG row cadence,
+                # so ppg_raw rows are already at original_scg_fs — not at the raw 100 Hz
+                # hardware rate. Resample PPG together with SCG when needed.
 
                 scg_mask = df_signals["x_g"].notna()
                 scg_x = df_signals.loc[scg_mask, "x_g"].to_numpy(dtype=np.float32)
                 scg_y = df_signals.loc[scg_mask, "y_g"].to_numpy(dtype=np.float32)
                 scg_z = df_signals.loc[scg_mask, "z_g"].to_numpy(dtype=np.float32)
+                ppg_raw = df_signals.loc[scg_mask, "ppg_raw"].to_numpy(dtype=np.float32) if "ppg_raw" in df_signals else None
 
                 if scg_x.size == 0:
-                    raise ValueError("No SCG samples found in subject CSV")
+                    raise ValueError("No SCG samples found in segmented CSV")
 
-                ecg = np.zeros_like(scg_x, dtype=np.float32)
+                if ppg_raw is None or ppg_raw.size == 0:
+                    ppg_raw = np.zeros_like(scg_x, dtype=np.float32)
 
-                if original_fs != self.target_fs:
-                    new_len = int(round(len(scg_x) * self.target_fs / float(original_fs)))
+                # Resample all channels together when SCG rate differs from target_fs.
+                if original_scg_fs != self.target_fs:
+                    new_len = int(round(len(scg_x) * self.target_fs / float(original_scg_fs)))
                     scg_x = signal.resample(scg_x, new_len)
                     scg_y = signal.resample(scg_y, new_len)
                     scg_z = signal.resample(scg_z, new_len)
-                    ecg = signal.resample(ecg, new_len)
+                    ppg_raw = signal.resample(ppg_raw, new_len)
 
                 results['signals'] = {
                     'AccX': scg_x,
                     'AccY': scg_y,
                     'AccZ': scg_z,
-                    'ECG': ecg
+                    'ECG': ppg_raw
                 }
                 results['fs'] = self.target_fs
                 results['signal_length'] = len(scg_x)
                 results['metadata'] = meta
             except Exception as e:
-                raise Exception(f"Failed to load subject CSV: {str(e)}")
+                raise Exception(f"Failed to load segmented CSV: {str(e)}")
 
-        # 2. Load selected annotation peaks (ECG R-peaks or AO peaks)
+        # 2. Load selected annotation peaks (ECG R-peaks or PPG peaks)
+        if annotation_source == "AUTO":
+            annotation_source = "ECG" if data_source == "cleaned" else "PPG"
         peak_info = self.load_annotation_peaks(patient_id, annotation_source, results['signal_length'])
         results['r_peaks_indices'] = peak_info['peak_indices']
         results['peak_source'] = peak_info['peak_source']
@@ -386,9 +380,9 @@ class HVDNetDataLoader:
             return None
 
         if task_name == "Task I (MS+AR)":
-            # Exact classes: AS, MR, MS+AR (no co-existing diseases, ignore Normal)
+            # Exact classes: AS, MR, MS+AR, N (no co-existing diseases)
             if total_positive == 0:
-                return None
+                return 3  # N
             if tr == 1:
                 return None
             if (as_val + mr + ms + ar) != 1:
@@ -454,6 +448,7 @@ class sCNN_Block(nn.Module):
         self.bn3 = nn.BatchNorm1d(out_channels)
 
         self.pool = nn.MaxPool1d(kernel_size=2)
+        self.dropout = nn.Dropout1d(p=0.2) # Spatial Dropout
 
         self.skip_projection = nn.Identity()
         if in_channels != out_channels:
@@ -476,12 +471,13 @@ class sCNN_Block(nn.Module):
         out += identity
         out = self.relu(out)
         out = self.pool(out)
+        out = self.dropout(out) # Apply spatial dropout before returning
 
         return out
 
 
 class SCNN_Module(nn.Module):
-    def __init__(self, in_channels=1, base_filters=64, kernel_sizes=(7, 7, 3)):
+    def __init__(self, in_channels=1, base_filters=32, kernel_sizes=(15, 7, 3)):
         super().__init__()
         channels = (base_filters, base_filters // 2, base_filters // 4)
         blocks = []
@@ -508,11 +504,13 @@ class LSTM_Module(nn.Module):
             num_layers=1,
             batch_first=True
         )
+        self.dropout = nn.Dropout(p=0.3) # Add dropout here
 
     def forward(self, x):
         # Convert (batch, channels, seq_len) -> (batch, seq_len, features)
         x = x.permute(0, 2, 1)
         out, _ = self.lstm(x)
+        out = self.dropout(out) # Apply to LSTM sequence output
         return out
 
 
@@ -553,29 +551,53 @@ class HVDNet(nn.Module):
     def __init__(self, num_classes=5, d=32):
         super(HVDNet, self).__init__()
 
+        self.scnn_x = sCNN_Module(in_channels=1, base_filters=d)
+        self.scnn_y = sCNN_Module(in_channels=1, base_filters=d)
         self.scnn_z = sCNN_Module(in_channels=1, base_filters=d)
 
-        self.sa_z = SA_Module(hidden_size=d // 4)
+        self.lstm_x = LSTM_Module(input_features=d // 4, hidden_size=d)
+        self.lstm_y = LSTM_Module(input_features=d // 4, hidden_size=d)
+        self.lstm_z = LSTM_Module(input_features=d // 4, hidden_size=d)
 
-        self.bn_z = nn.BatchNorm1d(d // 4)
+        self.sa_x = SA_Module(hidden_size=d)
+        self.sa_y = SA_Module(hidden_size=d)
+        self.sa_z = SA_Module(hidden_size=d)
+
+        self.bn_x = nn.BatchNorm1d(d)
+        self.bn_y = nn.BatchNorm1d(d)
+        self.bn_z = nn.BatchNorm1d(d)
         self.dropout_sa = nn.Dropout(p=0.7)
 
         self.classifier = nn.Sequential(
-            nn.Linear(d // 4, num_classes)
+            nn.Linear(3 * d, d),
+            nn.ReLU(),
+            nn.BatchNorm1d(d),
+            nn.Dropout(p=0.6),
+            nn.Linear(d, num_classes),
         )
 
-    def forward(self, z):
+    def forward(self, x, y, z):
+        feat_x = self.scnn_x(x)
+        feat_y = self.scnn_y(y)
         feat_z = self.scnn_z(z)
 
-        feat_z_seq = feat_z.permute(0, 2, 1)
-        ctx_z, attn_z = self.sa_z(feat_z_seq)
+        lstm_x = self.lstm_x(feat_x)
+        lstm_y = self.lstm_y(feat_y)
+        lstm_z = self.lstm_z(feat_z)
 
-        # Apply BN + Dropout after SA layer
+        ctx_x, attn_x = self.sa_x(lstm_x)
+        ctx_y, attn_y = self.sa_y(lstm_y)
+        ctx_z, attn_z = self.sa_z(lstm_z)
+
+        ctx_x = self.dropout_sa(self.bn_x(ctx_x))
+        ctx_y = self.dropout_sa(self.bn_y(ctx_y))
         ctx_z = self.dropout_sa(self.bn_z(ctx_z))
 
-        logits = self.classifier(ctx_z)
+        concat_vector = torch.cat((ctx_x, ctx_y, ctx_z), dim=1)
+        concat_vector = F.dropout(concat_vector, p=0.5, training=self.training)
+        logits = self.classifier(concat_vector)
 
-        return logits, attn_z
+        return logits, (attn_x, attn_y, attn_z)
 
 
 class TrainingWorker(QThread):
@@ -586,7 +608,7 @@ class TrainingWorker(QThread):
     error_update = pyqtSignal(str)
 
     def __init__(self, x_tensor, y_tensor, z_tensor, label_tensor, num_classes=5, d=32,
-                 num_epochs=100, batch_size=64, learning_rate=0.001, weight_decay=0.05,
+                 num_epochs=100, batch_size=64, learning_rate=0.0003, weight_decay=0.01,
                  test_size=0.2, n_splits=5, random_state=42, multi_label=False,
                  patient_ids=None, cv_mode="Patient-level K-Fold", use_augmentation=True, oversample_minority=False, class_names=None, parent=None):
         super().__init__(parent)
@@ -649,7 +671,7 @@ class TrainingWorker(QThread):
                 if self.multi_label:
                     labels = labels.float()
 
-                logits, _ = model(batch_z)
+                logits, _ = model(batch_x, batch_y, batch_z)
                 loss = criterion(logits, labels)
 
                 batch_weight = labels.numel() if self.multi_label else labels.size(0)
@@ -979,24 +1001,20 @@ class TrainingWorker(QThread):
                     criterion = nn.BCEWithLogitsLoss()
                 else:
                     fold_class_weights, fold_counts = self.compute_class_weights(label_train.cpu().numpy())
-                    criterion = FocalLoss(weight=fold_class_weights.to(device), gamma=2.0)
+                    criterion = nn.CrossEntropyLoss(
+                        weight=fold_class_weights.to(device),
+                        label_smoothing=0.15
+                    )
 
                 # Re-initialize the entire model for each new fold to prevent data leakage across folds
                 model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
-                classifier_params = list(model.classifier.parameters())
-                classifier_param_ids = {id(p) for p in classifier_params}
-                other_params = [
-                    p for p in model.parameters() if id(p) not in classifier_param_ids
-                ]
                 optimizer = torch.optim.AdamW(
-                    [
-                        {"params": other_params, "weight_decay": 0.0},
-                        {"params": classifier_params, "weight_decay": self.weight_decay},
-                    ],
+                    model.parameters(),
                     lr=self.learning_rate,
+                    weight_decay=self.weight_decay,
                 )
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                    optimizer, mode='min', factor=0.5, patience=8, min_lr=1e-6
+                    optimizer, mode='min', factor=0.5, patience=4, min_lr=1e-6
                 )
                 self.best_val_loss_fold = float('inf')
                 self.early_stop_counter = 0
@@ -1021,20 +1039,31 @@ class TrainingWorker(QThread):
                         batch_z = move_tensor_to_device(batch_z, device)
                         labels = move_tensor_to_device(labels, device)
                         if self.use_augmentation and model.training:
-                            noise_std = 0.05
-                            batch_x = batch_x + torch.randn_like(batch_x) * noise_std
-                            batch_y = batch_y + torch.randn_like(batch_y) * noise_std
-                            batch_z = batch_z + torch.randn_like(batch_z) * noise_std
+                            # 1. Amplitude Scale
                             scale = torch.empty(batch_x.size(0), 1, 1).uniform_(0.8, 1.2).to(device)
                             batch_x = batch_x * scale
                             batch_y = batch_y * scale
                             batch_z = batch_z * scale
                             
+                            # 2. Additive Noise
+                            noise_std = 0.05
+                            batch_x = batch_x + torch.randn_like(batch_x) * noise_std
+                            batch_y = batch_y + torch.randn_like(batch_y) * noise_std
+                            batch_z = batch_z + torch.randn_like(batch_z) * noise_std
+                            
+                            # 3. Random Temporal Shift (Roll) up to +/- 5% of the signal length (40 samples)
+                            shift_amounts = torch.randint(-40, 40, (batch_x.size(0),)).to(device)
+                            for i in range(batch_x.size(0)):
+                                shift = shift_amounts[i].item()
+                                batch_x[i] = torch.roll(batch_x[i], shifts=shift, dims=-1)
+                                batch_y[i] = torch.roll(batch_y[i], shifts=shift, dims=-1)
+                                batch_z[i] = torch.roll(batch_z[i], shifts=shift, dims=-1)
+                            
                         if self.multi_label:
                             labels = labels.float()
 
                         optimizer.zero_grad()
-                        logits, _ = model(batch_z)
+                        logits, _ = model(batch_x, batch_y, batch_z)
                         loss = criterion(logits, labels)
                         loss.backward()
                         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
@@ -1109,6 +1138,7 @@ class TrainingWorker(QThread):
                 'train_size': int(len(train_idx)),
                 'test_size': int(len(test_idx)),
                 'num_classes': self.num_classes,
+                'd': self.d,
                 'test_tensors': {
                     'x': x_test.detach().cpu(),
                     'y': y_test.detach().cpu(),
@@ -1199,10 +1229,11 @@ class HVDMainWindow(QMainWindow):
         self.patient_input.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.patient_input.setToolTip("Select a patient from the available cleaned files")
         self.task_selector = QComboBox()
-        self.task_selector.addItems(["Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"])
+        self.task_selector.addItems(["Task I (AS+MR)"])
         self.task_selector.currentTextChanged.connect(self.on_task_changed)
         self.annotation_selector = QComboBox()
-        self.annotation_selector.addItems(["ECG R-peaks", "AO peaks (Saved_Peaks)"])
+        self.annotation_selector.addItems(["Auto (ECG for Data/, PPG for Subject_Data_Segmented)"])
+        self.annotation_selector.setEnabled(False)
         self.peak_filter_selector = QComboBox()
         self.peak_filter_selector.addItems(["Keep all peaks", "Discard impossible peaks"])
         self.peak_filter_selector.setToolTip("Drops peaks with inter-peak intervals outside 0.50s to 1.50s (40-120 BPM) before segmentation when enabled.")
@@ -1494,7 +1525,7 @@ class HVDMainWindow(QMainWindow):
         self.refresh_class_attention_class_selector()
         self.update_step_controls()
         self.update_navigation_controls()
-        self.cv_strategy_dropdown.setEnabled(self.task_selector.currentText() in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"))
+        self.cv_strategy_dropdown.setEnabled(True)
 
     def log(self, message):
         self.console.append(message)
@@ -1519,16 +1550,11 @@ class HVDMainWindow(QMainWindow):
     def on_task_changed(self, task_name):
         self.refresh_class_attention_class_selector()
         self.populate_patient_dropdown(task_name)
+        # Only Task I (AS+MR) is supported; CV strategy and balancing are always enabled.
         if hasattr(self, 'cv_strategy_dropdown'):
-            is_task1 = task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)")
-            self.cv_strategy_dropdown.setEnabled(is_task1)
-            if not is_task1:
-                self.cv_strategy_dropdown.setCurrentText("Standard K-Fold")
+            self.cv_strategy_dropdown.setEnabled(True)
         if hasattr(self, 'balance_classes_checkbox'):
-            supports_balance = task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
-            self.balance_classes_checkbox.setEnabled(supports_balance)
-            if not supports_balance:
-                self.balance_classes_checkbox.setChecked(False)
+            self.balance_classes_checkbox.setEnabled(True)
 
     def format_patient_condition_text(self, label_row):
         if not isinstance(label_row, dict):
@@ -1563,7 +1589,7 @@ class HVDMainWindow(QMainWindow):
 
         for patient_id in patient_ids:
             label_row = label_lookup.get(patient_id)
-            if task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II") and not self.is_patient_eligible_for_task(label_row, task_name):
+            if not self.is_patient_eligible_for_task(label_row, task_name):
                 continue
             condition_text = self.format_patient_condition_text(label_row)
             display_text = f"{patient_id} - {condition_text}"
@@ -1597,11 +1623,7 @@ class HVDMainWindow(QMainWindow):
         return self.patient_input.text().strip()
 
     def get_selected_annotation_source(self):
-        if not hasattr(self, 'annotation_selector'):
-            return "ECG"
-        if self.annotation_selector.currentIndex() == 1:
-            return "AO"
-        return "ECG"
+        return "AUTO"
 
     def get_dataset_class_summary(self):
         if self.dataset_class_summary_cache is not None:
@@ -1617,7 +1639,7 @@ class HVDMainWindow(QMainWindow):
             'tasks': {}
         }
 
-        for task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"):
+        for task_name in ("Task I (AS+MR)",):
             class_names = self.loader.get_task_class_names(task_name)
             class_counts = np.zeros(len(class_names), dtype=np.int64)
             excluded_by_definition = 0
@@ -2019,6 +2041,8 @@ class HVDMainWindow(QMainWindow):
         model.eval()
         with torch.no_grad():
             logits, _ = model(
+                move_tensor_to_device(patient_data['x_batch'], device),
+                move_tensor_to_device(patient_data['y_batch'], device),
                 move_tensor_to_device(patient_data['z_batch'], device),
             )
             segment_probabilities = torch.sigmoid(logits).cpu().numpy()
@@ -2243,32 +2267,36 @@ class HVDMainWindow(QMainWindow):
         dummy_z = torch.randn(520, 1, 800)
 
         with torch.no_grad():
-            logits, attn_z = self.hvdnet_model(dummy_z)
+            logits, (attn_x, attn_y, attn_z) = self.hvdnet_model(dummy_x, dummy_y, dummy_z)
 
         self.current_data['hvdnet_outputs'] = {
             'logits': logits,
-            'attention_weights': attn_z
+            'attention_weights': (attn_x, attn_y, attn_z)
         }
 
         self.log("[SUCCESS] HVDNet initialized with late-fusion Z-axis branch.")
         self.log("[CHECKPOINT] Full network forward pass:")
+        self.log(f" > dummy_x shape: {tuple(dummy_x.shape)}")
+        self.log(f" > dummy_y shape: {tuple(dummy_y.shape)}")
         self.log(f" > dummy_z shape: {tuple(dummy_z.shape)}")
         self.log(f" > logits shape: {tuple(logits.shape)} (batch, 5)")
+        self.log(f" > attention_x shape: {tuple(attn_x.shape)}")
+        self.log(f" > attention_y shape: {tuple(attn_y.shape)}")
         self.log(f" > attention_z shape: {tuple(attn_z.shape)}")
         self.log(f" > Active task: {task_name} | Classes: {class_names}")
 
     def build_training_dataset(self, task_name, balance_classes=True):
         class_names = self.loader.get_task_class_names(task_name)
 
-        patient_ids = self.loader.list_available_patients()
-        if not patient_ids:
+        all_patient_ids = self.loader.list_available_patients()
+        if not all_patient_ids:
             raise RuntimeError(f"No training CSV files found in {self.loader.data_dir}")
 
         x_samples = []
         y_samples = []
         z_samples = []
         labels = []
-        patient_ids = []
+        segment_patient_ids = []  # per-segment patient ID list (distinct from all_patient_ids)
         skipped_by_task = 0
         skipped_no_segments = 0
         skipped_errors = 0
@@ -2277,10 +2305,10 @@ class HVDMainWindow(QMainWindow):
 
         balanced_patient_ids = None
         balance_max_per_class = None
-        if balance_classes and task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II"):
+        if balance_classes:
             label_rows = self.loader.load_labels_table()
             class_to_patients = {idx: [] for idx in range(len(class_names))}
-            for patient_id in patient_ids:
+            for patient_id in all_patient_ids:
                 label_row = label_rows.get(patient_id)
                 if label_row is None:
                     continue
@@ -2289,21 +2317,21 @@ class HVDMainWindow(QMainWindow):
                     continue
                 class_to_patients[int(class_index)].append(patient_id)
 
-                present_counts = [len(patients) for patients in class_to_patients.values() if patients]
-                if present_counts:
-                    min_count = min(present_counts)
-                    balance_max_per_class = max(1, 2 * int(min_count))
-                    rng = np.random.default_rng(42)
-                    selected = set()
-                    for patients in class_to_patients.values():
-                        if len(patients) <= balance_max_per_class:
-                            selected.update(patients)
-                        else:
-                            chosen = rng.choice(patients, size=balance_max_per_class, replace=False)
-                            selected.update(chosen.tolist())
-                    balanced_patient_ids = selected
+            present_counts = [len(patients) for patients in class_to_patients.values() if patients]
+            if present_counts:
+                min_count = min(present_counts)
+                balance_max_per_class = max(1, 2 * int(min_count))
+                rng = np.random.default_rng(42)
+                selected = set()
+                for patients in class_to_patients.values():
+                    if len(patients) <= balance_max_per_class:
+                        selected.update(patients)
+                    else:
+                        chosen = rng.choice(patients, size=balance_max_per_class, replace=False)
+                        selected.update(chosen.tolist())
+                balanced_patient_ids = selected
 
-        for patient_id in patient_ids:
+        for patient_id in all_patient_ids:
             if balanced_patient_ids is not None and patient_id not in balanced_patient_ids:
                 skipped_by_balance += 1
                 continue
@@ -2361,13 +2389,9 @@ class HVDMainWindow(QMainWindow):
                     x_samples.append(torch.tensor(seg_x, dtype=torch.float32).unsqueeze(0))
                     y_samples.append(torch.tensor(seg_y, dtype=torch.float32).unsqueeze(0))
                     z_samples.append(torch.tensor(seg_z, dtype=torch.float32).unsqueeze(0))
-                    patient_ids.append(patient_id)
-                    if task_name == "Task III":
-                        labels.append(torch.tensor(label_value, dtype=torch.float32))
-                        class_counts += label_value.astype(np.int64)
-                    else:
-                        labels.append(class_index)
-                        class_counts[class_index] += 1
+                    segment_patient_ids.append(patient_id)
+                    labels.append(class_index)
+                    class_counts[class_index] += 1
 
             except Exception:
                 skipped_errors += 1
@@ -2378,17 +2402,14 @@ class HVDMainWindow(QMainWindow):
         x_tensor = torch.stack(x_samples, dim=0)
         y_tensor = torch.stack(y_samples, dim=0)
         z_tensor = torch.stack(z_samples, dim=0)
-        if task_name == "Task III":
-            label_tensor = torch.stack(labels, dim=0).to(dtype=torch.float32)
-        else:
-            label_tensor = torch.tensor(labels, dtype=torch.long)
+        label_tensor = torch.tensor(labels, dtype=torch.long)
 
         return {
             'x_tensor': x_tensor,
             'y_tensor': y_tensor,
             'z_tensor': z_tensor,
             'label_tensor': label_tensor,
-            'patient_ids': patient_ids,
+            'patient_ids': segment_patient_ids,
             'num_samples': len(label_tensor),
             'class_counts': class_counts,
             'skipped_by_task': skipped_by_task,
@@ -2411,34 +2432,23 @@ class HVDMainWindow(QMainWindow):
                 f"Labeled: {summary['labeled_patients']} | "
                 f"Missing label rows: {summary['missing_label_rows']}"
             )
-            for task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II", "Task III"):
+            for task_name in ("Task I (AS+MR)",):
                 task_info = summary['tasks'][task_name]
                 class_parts = [
                     f"{name}={count}"
                     for name, count in zip(task_info['class_names'], task_info['class_counts'])
                 ]
-                extra_parts = []
-                if task_name == "Task III":
-                    extra_parts.append(f"Normal={task_info['normal_count']}")
-                elif task_name == "Task I (MS+AR)":
-                    extra_parts.append("Normal ignored")
-                elif task_name == "Task I (AS+MR)":
-                    extra_parts.append("Normal ignored")
                 self.log(
                     f" > {task_name}: "
                     + ", ".join(class_parts)
-                    + (" | " + ", ".join(extra_parts) if extra_parts else "")
-                    + (
-                        f" | Included={task_info['included_patients']}"
-                        f" | Excluded by definition={task_info['excluded_by_definition']}"
-                    )
+                    + f" | Included={task_info['included_patients']}"
+                    + f" | Excluded by definition={task_info['excluded_by_definition']}"
                 )
 
             task_name = self.task_selector.currentText()
             self.current_training_task = task_name
             balance_classes = (
-                task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
-                and hasattr(self, 'balance_classes_checkbox')
+                hasattr(self, 'balance_classes_checkbox')
                 and self.balance_classes_checkbox.isChecked()
             )
             dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
@@ -2446,16 +2456,13 @@ class HVDMainWindow(QMainWindow):
             cv_mode = "Standard K-Fold"
             if hasattr(self, 'cv_strategy_dropdown'):
                 cv_mode = self.cv_strategy_dropdown.currentText()
-                if task_name not in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"):
-                    self.log("[INFO] Specific CV strategy is only supported for Task I, Task I (MS+AR), and Task I (AS+MR). Using Standard K-Fold.")
-                    cv_mode = "Standard K-Fold"
 
             is_small_training = self.small_training_mode.currentIndex() == 1
             if cv_mode == "Leave-One-Subject-Out (LOSO)":
                 num_epochs = 50 if is_small_training else 100
                 patient_ids_list = dataset_info.get('patient_ids')
                 n_splits = len(np.unique(patient_ids_list)) if patient_ids_list else -1
-            elif cv_mode == "Patient-level K-Fold" and task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)"):
+            elif cv_mode == "Patient-level K-Fold":
                 num_epochs = 100
                 n_splits = 1
             else:
@@ -2484,11 +2491,11 @@ class HVDMainWindow(QMainWindow):
                 z_tensor=dataset_info['z_tensor'],
                 label_tensor=dataset_info['label_tensor'],
                 num_classes=len(dataset_info['class_names']),
-                d=64,
+                d=32,
                 num_epochs=num_epochs,
                 batch_size=64,
-                learning_rate=0.001,
-                weight_decay=0.05,
+                learning_rate=0.0003,
+                weight_decay=0.01,
                 test_size=0.2,
                 n_splits=n_splits,
                 random_state=42,
@@ -2508,16 +2515,12 @@ class HVDMainWindow(QMainWindow):
             self.is_training_paused = False
 
             self.log("[INFO] Training started in a background thread to keep the UI responsive.")
-            if task_name == "Task III":
-                self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold KFold on train pool.")
-            elif cv_mode == "Patient-level K-Fold":
+            if cv_mode == "Patient-level K-Fold":
                 self.log(
                     "[INFO] Split strategy: patient-level 80/20 stratified split, then a single stratified train/val split (no CV)."
                 )
             elif cv_mode == "Leave-One-Subject-Out (LOSO)":
                 self.log("[INFO] Split strategy: Leave-One-Subject-Out (LOSO) on all available patients.")
-            elif task_name in ("Task I (MS+AR)", "Task I (AS+MR)"):
-                self.log("[INFO] Split strategy: 80% train pool / 20% held-out test, then 2-fold stratified CV on train pool.")
             else:
                 self.log(f"[INFO] Split strategy: 80% train pool / 20% held-out test, then {n_splits}-fold stratified CV on train pool.")
             self.update_step_controls()
@@ -2564,7 +2567,8 @@ class HVDMainWindow(QMainWindow):
         self.last_test_tensors = summary.get('test_tensors')
         self.last_test_task_name = self.current_training_task
         self.last_test_class_names = summary.get('test_class_names')
-        self.hvdnet_model = HVDNet(num_classes=summary['num_classes'], d=64)
+        d_val = summary.get('d', 32)
+        self.hvdnet_model = HVDNet(num_classes=summary['num_classes'], d=d_val)
         self.hvdnet_model.load_state_dict(summary['best_state_dict'])
         self.loaded_model_task = self.current_training_task
         self.loaded_model_classes = self.loader.get_task_class_names(self.current_training_task)
@@ -2611,7 +2615,7 @@ class HVDMainWindow(QMainWindow):
         payload = {
             'model_state_dict': state_dict_cpu,
             'num_classes': len(class_names),
-            'd': 64,
+            'd': getattr(self, 'training_worker', None).d if getattr(self, 'training_worker', None) is not None else 32,
             'task_name': task_name,
             'class_names': class_names,
             'label_columns': self.loader.label_columns,
@@ -2641,7 +2645,8 @@ class HVDMainWindow(QMainWindow):
             class_names = self.loader.get_task_class_names(task_name)
 
         num_classes = payload.get('num_classes', len(class_names)) if isinstance(payload, dict) and 'model_state_dict' in payload else len(class_names)
-        self.hvdnet_model = HVDNet(num_classes=num_classes, d=64)
+        d_val = payload.get('d', 32) if isinstance(payload, dict) else 32
+        self.hvdnet_model = HVDNet(num_classes=num_classes, d=d_val)
         self.hvdnet_model.load_state_dict(state_dict)
         self.hvdnet_model.eval()
 
@@ -2774,9 +2779,13 @@ class HVDMainWindow(QMainWindow):
         segment_results = []
         signal_length = int(data['signal_length'])
         full_attention_sum = {
+            'X': np.zeros(signal_length, dtype=float),
+            'Y': np.zeros(signal_length, dtype=float),
             'Z': np.zeros(signal_length, dtype=float),
         }
         full_attention_count = {
+            'X': np.zeros(signal_length, dtype=float),
+            'Y': np.zeros(signal_length, dtype=float),
             'Z': np.zeros(signal_length, dtype=float),
         }
 
@@ -2787,7 +2796,9 @@ class HVDMainWindow(QMainWindow):
                     data['filtered_signals'],
                     segment,
                 )
-                logits, attn_z = model(
+                logits, (attn_x, attn_y, attn_z) = model(
+                    move_tensor_to_device(x_tensor, device),
+                    move_tensor_to_device(y_tensor, device),
                     move_tensor_to_device(z_tensor, device),
                 )
 
@@ -2800,6 +2811,8 @@ class HVDMainWindow(QMainWindow):
                     true_label = self.loader.map_label_row_to_task_index(data['labels'], task_name)
 
                 attn_arrays = {
+                    'X': attn_x.squeeze().detach().cpu().numpy(),
+                    'Y': attn_y.squeeze().detach().cpu().numpy(),
                     'Z': attn_z.squeeze().detach().cpu().numpy(),
                 }
 
@@ -2824,6 +2837,8 @@ class HVDMainWindow(QMainWindow):
                     'signal_y': data['filtered_signals']['AccY'][segment['start_idx']:segment['end_idx']],
                     'signal_z': data['filtered_signals']['AccZ'][segment['start_idx']:segment['end_idx']],
                     'signal_ecg': data['filtered_signals']['ECG'][segment['start_idx']:segment['end_idx']],
+                    'attention_x': attn_arrays['X'],
+                    'attention_y': attn_arrays['Y'],
                     'attention_z': attn_arrays['Z'],
                     'probabilities': segment_probabilities,
                     'prediction': segment_prediction,
@@ -2831,7 +2846,7 @@ class HVDMainWindow(QMainWindow):
                 })
 
         full_attention = {}
-        for axis_name in ('Z',):
+        for axis_name in ('X', 'Y', 'Z'):
             full_attention[axis_name] = np.divide(
                 full_attention_sum[axis_name],
                 full_attention_count[axis_name],
@@ -2901,15 +2916,21 @@ class HVDMainWindow(QMainWindow):
         ecg_plot.clear()
 
         title = f"Patient {patient_id} - {stage_name} | {title_prefix}"
-        if attention_maps is not None and 'Z' in attention_maps:
-            accx_plot.setTitle(title)
-            accx_plot.plot(t, accx, pen=pg.mkPen('#1f77b4', width=1))
-            accy_plot.plot(t, accy, pen=pg.mkPen('#ff7f0e', width=1))
-            self.plot_attention_overlay(accz, attention_maps['Z'], accz_plot, 'Z', title)
+        use_attention = attention_maps is not None
+        if use_attention and 'X' in attention_maps:
+            self.plot_attention_overlay(accx, attention_maps['X'], accx_plot, 'X', title)
         else:
             accx_plot.setTitle(title)
             accx_plot.plot(t, accx, pen=pg.mkPen('#1f77b4', width=1))
+
+        if use_attention and 'Y' in attention_maps:
+            self.plot_attention_overlay(accy, attention_maps['Y'], accy_plot, 'Y', title)
+        else:
             accy_plot.plot(t, accy, pen=pg.mkPen('#ff7f0e', width=1))
+
+        if use_attention and 'Z' in attention_maps:
+            self.plot_attention_overlay(accz, attention_maps['Z'], accz_plot, 'Z', title)
+        else:
             accz_plot.plot(t, accz, pen=pg.mkPen('#2ca02c', width=1))
         ecg_plot.plot(t, ecg, pen=pg.mkPen('#d62728', width=1))
 
@@ -3070,6 +3091,8 @@ class HVDMainWindow(QMainWindow):
             with torch.no_grad():
                 for bx, by, bz, bl in test_loader:
                     logits, _ = self.hvdnet_model(
+                        move_tensor_to_device(bx, device),
+                        move_tensor_to_device(by, device),
                         move_tensor_to_device(bz, device),
                     )
                     if is_multilabel:
@@ -3214,12 +3237,24 @@ class HVDMainWindow(QMainWindow):
                     if int(label.item()) != int(target_class_idx):
                         continue
 
+                x_input = move_tensor_to_device(x.unsqueeze(0), device)
+                y_input = move_tensor_to_device(y.unsqueeze(0), device)
                 z_input = move_tensor_to_device(z.unsqueeze(0), device)
 
-                _, attn_z = model(z_input)
+                _, (attn_x, attn_y, attn_z) = model(x_input, y_input, z_input)
 
-                collected_signals.append(z.squeeze().cpu().numpy())
-                collected_attention.append(attn_z.squeeze().detach().cpu().numpy())
+                axis_key = axis_name.upper()
+                if axis_key == 'X':
+                    collected_signals.append(x.squeeze().cpu().numpy())
+                    collected_attention.append(attn_x.squeeze().detach().cpu().numpy())
+                elif axis_key == 'Y':
+                    collected_signals.append(y.squeeze().cpu().numpy())
+                    collected_attention.append(attn_y.squeeze().detach().cpu().numpy())
+                elif axis_key == 'Z':
+                    collected_signals.append(z.squeeze().cpu().numpy())
+                    collected_attention.append(attn_z.squeeze().detach().cpu().numpy())
+                else:
+                    raise ValueError(f"Unsupported axis name: {axis_name}")
 
                 count += 1
                 if count >= num_samples:
@@ -3278,7 +3313,7 @@ class HVDMainWindow(QMainWindow):
 
             self.class_attention_widget.clear()
             class_axis_plots = []
-            for row_idx, axis_name in enumerate(("Z",)):
+            for row_idx, axis_name in enumerate(("X", "Y", "Z")):
                 mean_signal, mean_attn, count = self.get_mean_attention_for_class(
                     self.hvdnet_model,
                     test_dataset,
@@ -3684,11 +3719,23 @@ class HVDMainWindow(QMainWindow):
                 f"Inference | Segment {segment['segment_idx'] + 1}/{len(segment_results)} | "
                 f"{result['title_prefix']}"
             )
-            self.inf_accx_plot.plot(np.arange(len(segment['signal_x'])), segment['signal_x'], pen=pg.mkPen('#1f77b4', width=1))
-            self.inf_accx_plot.setTitle(segment_title + " | X")
-            self.inf_accy_plot.plot(np.arange(len(segment['signal_y'])), segment['signal_y'], pen=pg.mkPen('#ff7f0e', width=1))
-            self.inf_accy_plot.setTitle(segment_title + " | Y")
-            self.plot_attention_overlay(segment['signal_z'], segment['attention_z'], self.inf_accz_plot, 'Z', segment_title)
+            if 'attention_x' in segment:
+                self.plot_attention_overlay(segment['signal_x'], segment['attention_x'], self.inf_accx_plot, 'X', segment_title)
+            else:
+                self.inf_accx_plot.plot(np.arange(len(segment['signal_x'])), segment['signal_x'], pen=pg.mkPen('#1f77b4', width=1))
+                self.inf_accx_plot.setTitle(segment_title + " | X")
+
+            if 'attention_y' in segment:
+                self.plot_attention_overlay(segment['signal_y'], segment['attention_y'], self.inf_accy_plot, 'Y', segment_title)
+            else:
+                self.inf_accy_plot.plot(np.arange(len(segment['signal_y'])), segment['signal_y'], pen=pg.mkPen('#ff7f0e', width=1))
+                self.inf_accy_plot.setTitle(segment_title + " | Y")
+
+            if 'attention_z' in segment:
+                self.plot_attention_overlay(segment['signal_z'], segment['attention_z'], self.inf_accz_plot, 'Z', segment_title)
+            else:
+                self.inf_accz_plot.plot(np.arange(len(segment['signal_z'])), segment['signal_z'], pen=pg.mkPen('#2ca02c', width=1))
+                self.inf_accz_plot.setTitle(segment_title + " | Z")
             self.inf_ecg_plot.clear()
             self.inf_ecg_plot.plot(np.arange(len(segment['signal_ecg'])), segment['signal_ecg'], pen=pg.mkPen('#d62728', width=1))
             self.inf_ecg_plot.setTitle(f"ECG | Segment {segment['segment_idx'] + 1}/{len(segment_results)}")
