@@ -142,7 +142,7 @@ class HVDNetDataLoader:
                 label_lookup[patient_id] = self.build_label_row_from_metadata(patient_id, meta)
         return label_lookup
 
-    def list_available_patients(self):
+    def list_available_patients(self, source="All"):
         cleaned_paths = sorted(glob.glob(os.path.join(self.data_dir, "Cleaned_*.csv")))
         cleaned_ids = [
             os.path.basename(path).replace("Cleaned_", "").replace(".csv", "")
@@ -152,6 +152,12 @@ class HVDNetDataLoader:
             os.path.splitext(os.path.basename(path))[0]
             for path in self._list_segmented_csv_paths()
         ]
+        
+        if source == "Dataset 1 (Cleaned)":
+            return sorted(set(cleaned_ids))
+        elif source == "Dataset 2 (Segmented)":
+            return sorted(set(segmented_ids))
+            
         return sorted(set(cleaned_ids + segmented_ids))
 
     def load_annotation_peaks(self, patient_id, annotation_source, signal_length):
@@ -610,8 +616,12 @@ class TrainingWorker(QThread):
     def __init__(self, x_tensor, y_tensor, z_tensor, label_tensor, num_classes=5, d=32,
                  num_epochs=100, batch_size=64, learning_rate=0.0003, weight_decay=0.01,
                  test_size=0.2, n_splits=5, random_state=42, multi_label=False,
-                 patient_ids=None, cv_mode="Patient-level K-Fold", use_augmentation=True, oversample_minority=False, class_names=None, parent=None):
+                 patient_ids=None, cv_mode="Patient-level K-Fold", use_augmentation=True,
+                 oversample_minority=False, class_names=None, fine_tune=False, 
+                 pretrained_state_dict=None, parent=None):
         super().__init__(parent)
+        self.fine_tune = fine_tune
+        self.pretrained_state_dict = pretrained_state_dict
         self.oversample_minority = oversample_minority
         self.x_tensor = x_tensor
         self.y_tensor = y_tensor
@@ -754,20 +764,19 @@ class TrainingWorker(QThread):
                     unique_classes, class_freq = np.unique(patient_labels, return_counts=True)
                     if len(unique_classes) < 2:
                         raise RuntimeError("Need at least two classes for patient-level stratified split.")
+                        
+                    stratify_labels = patient_labels
                     if np.min(class_freq) < 2:
-                        raise RuntimeError("At least one class has fewer than 2 patients; cannot perform stratified 80/20 split.")
+                        self.log_update.emit("[WARNING] A class has < 2 patients. Falling back to non-stratified random split.")
+                        stratify_labels = None
 
-                    test_size = compute_stratified_split_size(
-                        len(patients),
-                        len(unique_classes),
-                        self.test_size,
-                    )
+                    test_size_val = self.test_size if self.test_size < 1 else int(self.test_size)
                     train_patients, test_patients = train_test_split(
                         patients,
-                        test_size=test_size,
+                        test_size=test_size_val,
                         random_state=self.random_state,
                         shuffle=True,
-                        stratify=patient_labels,
+                        stratify=stratify_labels,
                     )
 
                 train_patient_labels = np.array([patient_to_label[pid] for pid in train_patients])
@@ -784,16 +793,7 @@ class TrainingWorker(QThread):
                     unique_train, train_freq = np.unique(train_patient_labels, return_counts=True)
                     if self.n_splits <= 1:
                         if np.min(train_freq) < 2:
-                            underfilled = {
-                                class_name_map[int(label)]: int(count)
-                                for label, count in zip(unique_train, train_freq)
-                                if count < 2
-                            }
-                            raise RuntimeError(
-                                "Need at least 2 patients per class in training split for stratified train/val split. "
-                                f"Minimum class count is {np.min(train_freq)}. "
-                                f"Classes below threshold: {underfilled}."
-                            )
+                            self.log_update.emit("[WARNING] A training class has < 2 patients. Falling back to non-stratified validation checks.")
                     elif np.min(train_freq) < self.n_splits:
                         underfilled = {
                             class_name_map[int(label)]: int(count)
@@ -894,17 +894,19 @@ class TrainingWorker(QThread):
                     splitter = LeaveOneGroupOut()
                     split_iter = splitter.split(train_patients, train_patient_labels, groups=train_patients)
                 elif self.n_splits <= 1:
-                    val_size = compute_stratified_split_size(
-                        len(train_patients),
-                        len(np.unique(train_patient_labels)),
-                        self.test_size,
-                    )
+                    stratify_val_labels = train_patient_labels
+                    _, train_val_freq = np.unique(train_patient_labels, return_counts=True)
+                    if np.min(train_val_freq) < 2:
+                        self.log_update.emit("[WARNING] A training class has < 2 patients. Falling back to non-stratified val split.")
+                        stratify_val_labels = None
+                        
+                    val_size = self.test_size if self.test_size < 1 else int(self.test_size)
                     fold_train_patients, fold_val_patients = train_test_split(
                         train_patients,
                         test_size=val_size,
                         random_state=self.random_state,
                         shuffle=True,
-                        stratify=train_patient_labels,
+                        stratify=stratify_val_labels,
                     )
                     split_iter = [(fold_train_patients, fold_val_patients)]
                 else:
@@ -1008,11 +1010,30 @@ class TrainingWorker(QThread):
 
                 # Re-initialize the entire model for each new fold to prevent data leakage across folds
                 model = HVDNet(num_classes=self.num_classes, d=self.d).to(device)
-                optimizer = torch.optim.AdamW(
-                    model.parameters(),
-                    lr=self.learning_rate,
-                    weight_decay=self.weight_decay,
-                )
+                if getattr(self, 'pretrained_state_dict', None) is not None:
+                    model.load_state_dict(self.pretrained_state_dict)
+                
+                # If fine-tuning, freeze everything except the classifier
+                if getattr(self, 'fine_tune', False):
+                    self.log_update.emit("[INFO] Fine-tuning mode active: Freezing feature extractors.")
+                    for param in model.parameters():
+                        param.requires_grad = False
+                    for param in model.classifier.parameters():
+                        param.requires_grad = True
+                    
+                    # Use a much lower learning rate for fine-tuning
+                    active_lr = 1e-4 
+                    active_params = filter(lambda p: p.requires_grad, model.parameters())
+                    optimizer = torch.optim.AdamW(active_params, lr=active_lr, weight_decay=self.weight_decay)
+                else:
+                    active_lr = self.learning_rate
+                    optimizer = torch.optim.AdamW(
+                        model.parameters(),
+                        lr=active_lr,
+                        weight_decay=self.weight_decay
+                    )
+
+                # Initialize scheduler
                 scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
                     optimizer, mode='min', factor=0.5, patience=4, min_lr=1e-6
                 )
@@ -1027,7 +1048,15 @@ class TrainingWorker(QThread):
                 for epoch in range(self.num_epochs):
                     self.wait_if_paused()
                     epoch_start = time.perf_counter()
+                    
+                    # 1. Set the default mode
                     model.train()
+                    
+                    # 2. If fine-tuning, override the frozen layers to eval mode
+                    if getattr(self, 'fine_tune', False):
+                        model.eval()               # Puts EVERYTHING (including BN/Dropout) in eval mode
+                        model.classifier.train()   # Turns ONLY the classifier back to train mode
+
                     running_loss = 0.0
                     correct_predictions = 0
                     total_samples = 0
@@ -1275,6 +1304,17 @@ class HVDMainWindow(QMainWindow):
         self.oversample_checkbox.setToolTip("Randomly duplicates segments from minority classes so that all classes have the same number of samples during training.")
         self.oversample_checkbox.setChecked(True)
         
+        self.dataset_selector = QComboBox()
+        self.dataset_selector.addItems(["All", "Dataset 1 (Cleaned)", "Dataset 2 (Segmented)"])
+        self.dataset_selector.setToolTip("Select which folder to use for training/testing.")
+        
+        self.finetune_checkbox = QCheckBox("Fine-tune (Freeze Feature Extractors)")
+        self.finetune_checkbox.setToolTip("Freezes sCNN and LSTM layers, training only the final classifier at a lower learning rate.")
+        
+        self.auto_transfer_checkbox = QCheckBox("Auto Transfer Learning (Cleaned -> Segmented)")
+        self.auto_transfer_checkbox.setToolTip("Automatically trains on Cleaned data first, then loads and fine-tunes on Segmented data in one sequential go.")
+        self.auto_transfer_phase = None
+        
         self.pause_resume_btn = QPushButton("Pause Training")
         self.pause_resume_btn.clicked.connect(self.step_toggle_training_pause)
         self.load_model_btn = QPushButton("Load Saved\nModel")
@@ -1350,7 +1390,13 @@ class HVDMainWindow(QMainWindow):
         input_layout.addWidget(self.balance_classes_checkbox)
         input_layout.addWidget(self.cv_strategy_dropdown)
         input_layout.addWidget(self.augmentation_checkbox)
-        input_layout.addWidget(self.oversample_checkbox)
+        dataset_row = QHBoxLayout()
+        dataset_row.addWidget(QLabel("Dataset:"))
+        dataset_row.addWidget(self.dataset_selector)
+        input_layout.addLayout(dataset_row)
+        input_layout.addWidget(self.finetune_checkbox)
+        input_layout.addWidget(self.auto_transfer_checkbox)
+        
         input_layout.addWidget(self.step9_btn)
         input_layout.addWidget(self.pause_resume_btn)
         input_layout.addWidget(self.load_model_btn)
@@ -2288,7 +2334,15 @@ class HVDMainWindow(QMainWindow):
     def build_training_dataset(self, task_name, balance_classes=True):
         class_names = self.loader.get_task_class_names(task_name)
 
-        all_patient_ids = self.loader.list_available_patients()
+        phase = getattr(self, 'auto_transfer_phase', None)
+        if phase == "pretrain":
+            selected_dataset = "Dataset 1 (Cleaned)"
+        elif phase == "finetune":
+            selected_dataset = "Dataset 2 (Segmented)"
+        else:
+            selected_dataset = self.dataset_selector.currentText()
+            
+        all_patient_ids = self.loader.list_available_patients(source=selected_dataset)
         if not all_patient_ids:
             raise RuntimeError(f"No training CSV files found in {self.loader.data_dir}")
 
@@ -2447,6 +2501,14 @@ class HVDMainWindow(QMainWindow):
 
             task_name = self.task_selector.currentText()
             self.current_training_task = task_name
+            
+            is_auto = hasattr(self, 'auto_transfer_checkbox') and self.auto_transfer_checkbox.isChecked()
+            if is_auto:
+                self.auto_transfer_phase = "pretrain"
+                self.log("[AUTO-TRANSFER] Phase 1: Launching pre-training on Dataset 1 (Cleaned)...")
+            else:
+                self.auto_transfer_phase = None
+
             balance_classes = (
                 hasattr(self, 'balance_classes_checkbox')
                 and self.balance_classes_checkbox.isChecked()
@@ -2485,6 +2547,8 @@ class HVDMainWindow(QMainWindow):
                 self.log(f" > Skipped by patient balancing: {dataset_info['skipped_by_balance']}")
             self.log(f" > Skipped patients with no segments: {dataset_info['skipped_no_segments']}")
             self.log(f" > Skipped errors: {dataset_info['skipped_errors']}")
+            is_finetuning = hasattr(self, 'finetune_checkbox') and self.finetune_checkbox.isChecked() if not is_auto else False
+            pretrained_dict = None
             self.training_worker = TrainingWorker(
                 x_tensor=dataset_info['x_tensor'],
                 y_tensor=dataset_info['y_tensor'],
@@ -2505,6 +2569,8 @@ class HVDMainWindow(QMainWindow):
                 use_augmentation=self.augmentation_checkbox.isChecked() if hasattr(self, 'augmentation_checkbox') else False,
                 oversample_minority=self.oversample_checkbox.isChecked() if hasattr(self, 'oversample_checkbox') else False,
                 class_names=dataset_info.get('class_names'),
+                fine_tune=is_finetuning,
+                pretrained_state_dict=pretrained_dict,
             )
             self.training_worker.log_update.connect(self.log)
             self.training_worker.epoch_update.connect(self.on_training_epoch_update)
@@ -2563,6 +2629,16 @@ class HVDMainWindow(QMainWindow):
 
     def on_training_finished(self, summary):
         self.is_training_paused = False
+        
+        # If in auto-transfer mode and pre-training phase has completed
+        if getattr(self, 'auto_transfer_phase', None) == "pretrain":
+            self.log("[AUTO-TRANSFER] Phase 1 (Pre-training) completed on Dataset 1 (Cleaned).")
+            self.log(f" > Best pre-training fold: {summary['best_fold']} | Best Val Loss: {summary['best_val_loss']:.4f}")
+            self.log("[AUTO-TRANSFER] Phase 2: Launching fine-tuning on Dataset 2 (Segmented)...")
+            self.auto_transfer_phase = "finetune"
+            self.start_auto_transfer_finetune(summary['best_state_dict'])
+            return
+
         self.last_training_summary = summary
         self.last_test_tensors = summary.get('test_tensors')
         self.last_test_task_name = self.current_training_task
@@ -2575,7 +2651,12 @@ class HVDMainWindow(QMainWindow):
         self.task_selector.setCurrentText(self.current_training_task)
         self.refresh_class_attention_class_selector()
 
-        self.log("[SUCCESS] Training complete.")
+        if getattr(self, 'auto_transfer_phase', None) == "finetune":
+            self.log("[SUCCESS] Auto Transfer Learning completed successfully! Pre-trained on Dataset 1 and fine-tuned on Dataset 2.")
+        else:
+            self.log("[SUCCESS] Training complete.")
+            
+        self.auto_transfer_phase = None
         self.log(f" > Best fold by validation loss: {summary['best_fold']}")
         self.log(f" > Best validation loss: {summary['best_val_loss']:.4f}")
         self.log(f" > Held-out test size: {summary['test_size']}")
@@ -2583,8 +2664,74 @@ class HVDMainWindow(QMainWindow):
         self.log(f" > Held-out test accuracy: {summary['test_acc']:.2f}%")
         self.update_step_controls()
 
+    def start_auto_transfer_finetune(self, pretrained_state_dict):
+        try:
+            task_name = self.current_training_task
+            is_small_training = self.small_training_mode.currentIndex() == 1 if hasattr(self, 'small_training_mode') else False
+            cv_mode = self.cv_strategy_dropdown.currentText() if hasattr(self, 'cv_strategy_dropdown') else "Patient-level K-Fold"
+            
+            # 1. Build Dataset 2 (Segmented)
+            balance_classes = (
+                task_name in ("Task I", "Task I (MS+AR)", "Task I (AS+MR)", "Task II")
+                and hasattr(self, 'balance_classes_checkbox')
+                and self.balance_classes_checkbox.isChecked()
+            )
+            dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
+            
+            # 2. Get training hyperparams
+            if cv_mode == "Leave-One-Subject-Out (LOSO)":
+                num_epochs = 50 if is_small_training else 100
+                patient_ids_list = dataset_info.get('patient_ids')
+                n_splits = len(np.unique(patient_ids_list)) if patient_ids_list else -1
+            elif cv_mode == "Patient-level K-Fold":
+                num_epochs = 100
+                n_splits = 1
+            else:
+                num_epochs = 50 if is_small_training else 100
+                n_splits = 3 if is_small_training else 5
+
+            self.current_num_epochs = num_epochs
+            self.current_n_splits = n_splits
+
+            # 3. Create TrainingWorker with fine_tune=True and pass pretrained weights
+            self.training_worker = TrainingWorker(
+                x_tensor=dataset_info['x_tensor'],
+                y_tensor=dataset_info['y_tensor'],
+                z_tensor=dataset_info['z_tensor'],
+                label_tensor=dataset_info['label_tensor'],
+                num_classes=len(dataset_info['class_names']),
+                d=32,
+                num_epochs=num_epochs,
+                batch_size=64,
+                learning_rate=0.0003,
+                weight_decay=0.01,
+                test_size=0.2,
+                n_splits=n_splits,
+                random_state=42,
+                multi_label=(task_name == "Task III"),
+                patient_ids=dataset_info.get('patient_ids'),
+                cv_mode=cv_mode,
+                use_augmentation=self.augmentation_checkbox.isChecked() if hasattr(self, 'augmentation_checkbox') else False,
+                oversample_minority=self.oversample_checkbox.isChecked() if hasattr(self, 'oversample_checkbox') else False,
+                class_names=dataset_info.get('class_names'),
+                fine_tune=True,
+                pretrained_state_dict=pretrained_state_dict,
+            )
+            self.training_worker.log_update.connect(self.log)
+            self.training_worker.epoch_update.connect(self.on_training_epoch_update)
+            self.training_worker.test_update.connect(self.on_test_metrics_update)
+            self.training_worker.error_update.connect(self.on_training_error)
+            self.training_worker.finished_update.connect(self.on_training_finished)
+            self.training_worker.start()
+            self.is_training_paused = False
+        except Exception as e:
+            self.auto_transfer_phase = None
+            self.log(f"[ERROR] Fine-tuning transition failed: {str(e)}")
+            self.update_step_controls()
+
     def on_training_error(self, message):
         self.is_training_paused = False
+        self.auto_transfer_phase = None
         self.log(f"[ERROR] Training failed: {message}")
         self.update_step_controls()
 
