@@ -16,6 +16,15 @@ from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import KFold, train_test_split, StratifiedKFold, LeaveOneGroupOut
 from sklearn.metrics import confusion_matrix, accuracy_score, precision_recall_fscore_support
 import scipy.ndimage
+
+# TimeGAN for optional oversampling augmentation
+from timegan import (
+    TimeGAN,
+    train_timegan,
+    generate_samples,
+    save_timegan_checkpoint,
+    load_timegan_checkpoint,
+)
 from PyQt5.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                              QHBoxLayout, QLabel, QLineEdit, QPushButton, QTextEdit, QFileDialog, QComboBox, QTabWidget, QGridLayout, QScrollArea, QSizePolicy, QCheckBox)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QRectF
@@ -510,7 +519,7 @@ class LSTM_Module(nn.Module):
             num_layers=1,
             batch_first=True
         )
-        self.dropout = nn.Dropout(p=0.3) # Add dropout here
+        self.dropout = nn.Dropout(p=0.2) # Add dropout here
 
     def forward(self, x):
         # Convert (batch, channels, seq_len) -> (batch, seq_len, features)
@@ -572,13 +581,13 @@ class HVDNet(nn.Module):
         self.bn_x = nn.BatchNorm1d(d)
         self.bn_y = nn.BatchNorm1d(d)
         self.bn_z = nn.BatchNorm1d(d)
-        self.dropout_sa = nn.Dropout(p=0.7)
+        self.dropout_sa = nn.Dropout(p=0.3)
 
         self.classifier = nn.Sequential(
             nn.Linear(3 * d, d),
             nn.ReLU(),
             nn.BatchNorm1d(d),
-            nn.Dropout(p=0.6),
+            nn.Dropout(p=0.3),
             nn.Linear(d, num_classes),
         )
 
@@ -600,7 +609,7 @@ class HVDNet(nn.Module):
         ctx_z = self.dropout_sa(self.bn_z(ctx_z))
 
         concat_vector = torch.cat((ctx_x, ctx_y, ctx_z), dim=1)
-        concat_vector = F.dropout(concat_vector, p=0.5, training=self.training)
+        concat_vector = F.dropout(concat_vector, p=0.3, training=self.training)
         logits = self.classifier(concat_vector)
 
         return logits, (attn_x, attn_y, attn_z)
@@ -618,11 +627,15 @@ class TrainingWorker(QThread):
                  test_size=0.2, n_splits=5, random_state=42, multi_label=False,
                  patient_ids=None, cv_mode="Patient-level K-Fold", use_augmentation=True,
                  oversample_minority=False, class_names=None, fine_tune=False, 
-                 pretrained_state_dict=None, parent=None):
+                 pretrained_state_dict=None, parent=None,
+                 use_timegan=False, timegan_checkpoint_path=""):
         super().__init__(parent)
         self.fine_tune = fine_tune
         self.pretrained_state_dict = pretrained_state_dict
         self.oversample_minority = oversample_minority
+        self.use_timegan = use_timegan
+        self.timegan_checkpoint_path = timegan_checkpoint_path
+        self.timegan_model = None
         self.x_tensor = x_tensor
         self.y_tensor = y_tensor
         self.z_tensor = z_tensor
@@ -724,7 +737,11 @@ class TrainingWorker(QThread):
 
             is_patient_level = self.cv_mode in ("Patient-level K-Fold", "Leave-One-Subject-Out (LOSO)")
             
-            if is_patient_level:
+            if self.cv_mode == "Train on All (No CV)":
+                train_idx = all_indices
+                test_idx = np.array([], dtype=int)
+                splitter = None
+            elif is_patient_level:
                 if self.multi_label:
                     raise RuntimeError("Patient-level splitting is not supported for Task III.")
                 if self.patient_ids is None:
@@ -882,7 +899,33 @@ class TrainingWorker(QThread):
             best_fold = -1
             best_state_dict = None
 
-            if is_patient_level:
+            # ── TimeGAN: load pre-trained checkpoint (trained on Colab) ──
+            if self.use_timegan and not self.multi_label and len(train_idx) > 0:
+                try:
+                    from timegan import TimeGAN, load_timegan_checkpoint
+                    cpu_device = torch.device("cpu")
+                    ckpt_path = getattr(self, 'timegan_checkpoint_path', "") or ""
+
+                    if ckpt_path and os.path.exists(ckpt_path):
+                        self.log_update.emit(f"[TIMEGAN] Loading checkpoint from {ckpt_path}...")
+                        timegan_model, _ = load_timegan_checkpoint(ckpt_path, device=cpu_device)
+                        self.timegan_model = timegan_model
+                        self.log_update.emit("[TIMEGAN] Checkpoint loaded. Ready for per-fold generation.")
+                    else:
+                        self.log_update.emit(
+                            "[TIMEGAN] No checkpoint found. TimeGAN disabled. "
+                            "Use 'Export for Colab' to train on Google Colab with CUDA."
+                        )
+                        self.use_timegan = False
+                        self.timegan_model = None
+                except Exception as tg_exc:
+                    self.log_update.emit(f"[TIMEGAN] Error loading checkpoint: {tg_exc}. Disabling.")
+                    self.use_timegan = False
+                    self.timegan_model = None
+
+            if self.cv_mode == "Train on All (No CV)":
+                split_iter = [(np.arange(len(train_idx)), np.array([], dtype=int))]
+            elif is_patient_level:
                 patient_ids_np = np.asarray(self.patient_ids)
                 patient_to_indices = {}
                 for idx, patient_id in enumerate(patient_ids_np):
@@ -942,6 +985,64 @@ class TrainingWorker(QThread):
                 y_train = self.y_tensor[fold_train_idx]
                 z_train = self.z_tensor[fold_train_idx]
                 label_train = self.label_tensor[fold_train_idx]
+
+                # ── TimeGAN per-fold synthetic generation ──
+                if self.use_timegan and self.timegan_model is not None and not self.multi_label:
+                    try:
+                        train_counts_tg = np.bincount(
+                            label_train.cpu().numpy(), minlength=self.num_classes
+                        )
+                        max_count_tg = train_counts_tg.max()
+                        tg_synthetic_x = []
+                        tg_synthetic_y = []
+                        tg_synthetic_z = []
+                        tg_synthetic_labels = []
+
+                        for class_idx_tg, count_tg in enumerate(train_counts_tg):
+                            if 0 < count_tg < max_count_tg:
+                                num_to_gen = max_count_tg - count_tg
+                                gen_segments = generate_samples(
+                                    self.timegan_model,
+                                    num_to_gen,
+                                    class_idx_tg,
+                                    self.timegan_model.num_classes,
+                                )  # (num_to_gen, 3, 800) — model on CPU
+
+                                tg_synthetic_x.append(gen_segments[:, 0:1, :])
+                                tg_synthetic_y.append(gen_segments[:, 1:2, :])
+                                tg_synthetic_z.append(gen_segments[:, 2:3, :])
+                                tg_synthetic_labels.append(
+                                    torch.full((num_to_gen,), class_idx_tg, dtype=torch.long, device="cpu")
+                                )
+
+                        if tg_synthetic_x:
+                            x_train = torch.cat([x_train] + tg_synthetic_x, dim=0)
+                            y_train = torch.cat([y_train] + tg_synthetic_y, dim=0)
+                            z_train = torch.cat([z_train] + tg_synthetic_z, dim=0)
+                            label_train = torch.cat([label_train] + tg_synthetic_labels, dim=0)
+
+                            total_gen = sum(len(t) for t in tg_synthetic_labels)
+                            class_name_map_tg = self.class_names or [str(i) for i in range(self.num_classes)]
+                            added_str_tg = ', '.join(
+                                f'{class_name_map_tg[ci]}={max_count_tg - train_counts_tg[ci]}'
+                                for ci in range(self.num_classes)
+                                if 0 < train_counts_tg[ci] < max_count_tg
+                            )
+                            new_counts_tg = np.bincount(
+                                label_train.cpu().numpy(), minlength=self.num_classes
+                            )
+                            new_counts_str_tg = ', '.join(
+                                f'{class_name_map_tg[i]}={new_counts_tg[i]}'
+                                for i in range(self.num_classes)
+                            )
+                            self.log_update.emit(
+                                f" > TimeGAN generated {total_gen} segments: "
+                                f"{added_str_tg} | New counts: [{new_counts_str_tg}]"
+                            )
+                    except Exception as tg_fold_exc:
+                        self.log_update.emit(
+                            f"[WARN] TimeGAN per-fold generation failed (fold {fold_idx}): {tg_fold_exc}"
+                        )
 
                 if self.oversample_minority and not self.multi_label:
                     train_counts = np.bincount(label_train.cpu().numpy())
@@ -1017,7 +1118,7 @@ class TrainingWorker(QThread):
                 if getattr(self, 'fine_tune', False):
                     self.log_update.emit("[INFO] Fine-tuning mode active: Freezing feature extractors.")
                     for param in model.parameters():
-                        param.requires_grad = False
+                        param.requires_grad = False 
                     for param in model.classifier.parameters():
                         param.requires_grad = True
                     
@@ -1110,7 +1211,10 @@ class TrainingWorker(QThread):
 
                     train_loss = running_loss / max(total_samples, 1)
                     train_acc = 100.0 * correct_predictions / max(total_samples, 1)
-                    val_loss, val_acc = self.evaluate_loader(model, criterion, val_loader, device)
+                    if self.cv_mode == "Train on All (No CV)":
+                        val_loss, val_acc = train_loss, train_acc
+                    else:
+                        val_loss, val_acc = self.evaluate_loader(model, criterion, val_loader, device)
                     scheduler.step(val_loss)
                     epoch_seconds = time.perf_counter() - epoch_start
 
@@ -1124,7 +1228,8 @@ class TrainingWorker(QThread):
                         best_fold = fold_idx
                         best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-                    if val_loss < self.best_val_loss_fold:
+                    min_delta = 1e-4 if self.cv_mode == "Train on All (No CV)" else 0.0
+                    if val_loss < self.best_val_loss_fold - min_delta:
                         self.best_val_loss_fold = val_loss
                         self.early_stop_counter = 0
                     else:
@@ -1292,7 +1397,7 @@ class HVDMainWindow(QMainWindow):
         self.balance_classes_checkbox.setChecked(True)
         
         self.cv_strategy_dropdown = QComboBox()
-        self.cv_strategy_dropdown.addItems(["Standard K-Fold", "Patient-level K-Fold", "Leave-One-Subject-Out (LOSO)"])
+        self.cv_strategy_dropdown.addItems(["Standard K-Fold", "Patient-level K-Fold", "Leave-One-Subject-Out (LOSO)", "Train on All (No CV)"])
         self.cv_strategy_dropdown.setCurrentText("Patient-level K-Fold")
         self.cv_strategy_dropdown.setToolTip("Select the cross-validation strategy.")
 
@@ -1303,7 +1408,29 @@ class HVDMainWindow(QMainWindow):
         self.oversample_checkbox = QCheckBox("Oversample Minority Classes")
         self.oversample_checkbox.setToolTip("Randomly duplicates segments from minority classes so that all classes have the same number of samples during training.")
         self.oversample_checkbox.setChecked(True)
-        
+
+        self.timegan_checkbox = QCheckBox("TimeGAN Oversampling (Experimental)")
+        self.timegan_checkbox.setToolTip(
+            "Requires a pre-trained TimeGAN checkpoint (train on Google Colab). "
+            "Generates synthetic SCG segments for minority classes per fold. "
+            "Not supported for multi-label (Task III)."
+        )
+        self.timegan_checkbox.setChecked(False)
+
+        self.timegan_ckpt_path_input = QLineEdit()
+        self.timegan_ckpt_path_input.setPlaceholderText("Path to timegan_checkpoint.pt (optional)")
+        self.timegan_ckpt_path_input.setToolTip(
+            "Full path to a pre-trained TimeGAN checkpoint file. "
+            "Train on Google Colab using timegan_colab.ipynb, then download "
+            "the .pt file and enter its path here."
+        )
+
+        self.colab_export_btn = QPushButton("Export for Colab")
+        self.colab_export_btn.setToolTip(
+            "Exports segments.npy and labels.npy for training on Google Colab."
+        )
+        self.colab_export_btn.clicked.connect(self.export_training_data_for_colab)
+
         self.dataset_selector = QComboBox()
         self.dataset_selector.addItems(["All", "Dataset 1 (Cleaned)", "Dataset 2 (Segmented)"])
         self.dataset_selector.setToolTip("Select which folder to use for training/testing.")
@@ -1390,6 +1517,10 @@ class HVDMainWindow(QMainWindow):
         input_layout.addWidget(self.balance_classes_checkbox)
         input_layout.addWidget(self.cv_strategy_dropdown)
         input_layout.addWidget(self.augmentation_checkbox)
+        input_layout.addWidget(self.oversample_checkbox)
+        input_layout.addWidget(self.timegan_checkbox)
+        input_layout.addWidget(self.timegan_ckpt_path_input)
+        input_layout.addWidget(self.colab_export_btn)
         dataset_row = QHBoxLayout()
         dataset_row.addWidget(QLabel("Dataset:"))
         dataset_row.addWidget(self.dataset_selector)
@@ -2514,6 +2645,7 @@ class HVDMainWindow(QMainWindow):
                 and self.balance_classes_checkbox.isChecked()
             )
             dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
+            self.last_built_dataset = dataset_info
 
             cv_mode = "Standard K-Fold"
             if hasattr(self, 'cv_strategy_dropdown'):
@@ -2526,6 +2658,9 @@ class HVDMainWindow(QMainWindow):
                 n_splits = len(np.unique(patient_ids_list)) if patient_ids_list else -1
             elif cv_mode == "Patient-level K-Fold":
                 num_epochs = 100
+                n_splits = 1
+            elif cv_mode == "Train on All (No CV)":
+                num_epochs = 50 if is_small_training else 100
                 n_splits = 1
             else:
                 num_epochs = 50 if is_small_training else 100
@@ -2571,6 +2706,8 @@ class HVDMainWindow(QMainWindow):
                 class_names=dataset_info.get('class_names'),
                 fine_tune=is_finetuning,
                 pretrained_state_dict=pretrained_dict,
+                use_timegan=self.timegan_checkbox.isChecked() if hasattr(self, 'timegan_checkbox') else False,
+                timegan_checkpoint_path=self.timegan_ckpt_path_input.text().strip() if hasattr(self, 'timegan_ckpt_path_input') else "",
             )
             self.training_worker.log_update.connect(self.log)
             self.training_worker.epoch_update.connect(self.on_training_epoch_update)
@@ -2677,7 +2814,8 @@ class HVDMainWindow(QMainWindow):
                 and self.balance_classes_checkbox.isChecked()
             )
             dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
-            
+            self.last_built_dataset = dataset_info
+
             # 2. Get training hyperparams
             if cv_mode == "Leave-One-Subject-Out (LOSO)":
                 num_epochs = 50 if is_small_training else 100
@@ -2685,6 +2823,9 @@ class HVDMainWindow(QMainWindow):
                 n_splits = len(np.unique(patient_ids_list)) if patient_ids_list else -1
             elif cv_mode == "Patient-level K-Fold":
                 num_epochs = 100
+                n_splits = 1
+            elif cv_mode == "Train on All (No CV)":
+                num_epochs = 50 if is_small_training else 100
                 n_splits = 1
             else:
                 num_epochs = 50 if is_small_training else 100
@@ -2716,6 +2857,8 @@ class HVDMainWindow(QMainWindow):
                 class_names=dataset_info.get('class_names'),
                 fine_tune=True,
                 pretrained_state_dict=pretrained_state_dict,
+                use_timegan=self.timegan_checkbox.isChecked() if hasattr(self, 'timegan_checkbox') else False,
+                timegan_checkpoint_path=self.timegan_ckpt_path_input.text().strip() if hasattr(self, 'timegan_ckpt_path_input') else "",
             )
             self.training_worker.log_update.connect(self.log)
             self.training_worker.epoch_update.connect(self.on_training_epoch_update)
@@ -2734,6 +2877,65 @@ class HVDMainWindow(QMainWindow):
         self.auto_transfer_phase = None
         self.log(f"[ERROR] Training failed: {message}")
         self.update_step_controls()
+
+    def export_training_data_for_colab(self):
+        """Build the dataset and export as .npy files for Google Colab TimeGAN training."""
+        try:
+            # Get current task settings
+            task_name = self.task_selector.currentText() if hasattr(self, 'task_selector') else "Task I (AS+MR)"
+            balance_classes = (
+                hasattr(self, 'balance_classes_checkbox')
+                and self.balance_classes_checkbox.isChecked()
+            )
+
+            self.log(f"[EXPORT] Building dataset for task: {task_name} (balance_classes={balance_classes})...")
+
+            # Build the dataset (same as Step 9 does internally)
+            dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
+            self.last_built_dataset = dataset_info
+
+            x_t = dataset_info['x_tensor']
+            y_t = dataset_info['y_tensor']
+            z_t = dataset_info['z_tensor']
+            label_t = dataset_info['label_tensor']
+            class_names = dataset_info['class_names']
+
+            # Stack into (N, 3, 800)
+            stacked = torch.cat([x_t, y_t, z_t], dim=1)  # (N, 3, 800)
+            segments_np = stacked.numpy()
+            labels_np = label_t.numpy().astype(np.int64)
+            class_names_np = np.array(class_names, dtype=object)
+
+            export_dir = "timegan_colab_data"
+            os.makedirs(export_dir, exist_ok=True)
+
+            np.save(os.path.join(export_dir, "segments.npy"), segments_np)
+            np.save(os.path.join(export_dir, "labels.npy"), labels_np)
+            np.save(os.path.join(export_dir, "class_names.npy"), class_names_np)
+
+            counts = np.bincount(labels_np, minlength=len(class_names))
+            counts_str = ', '.join(f'{class_names[i]}={counts[i]}' for i in range(len(class_names)))
+
+            self.log(f"[EXPORT] ✅ Data exported to '{export_dir}/':")
+            self.log(f"  segments.npy     shape={list(segments_np.shape)}  ({segments_np.nbytes / 1e6:.1f} MB)")
+            self.log(f"  labels.npy       shape={list(labels_np.shape)}")
+            self.log(f"  class_names.npy  {class_names_np.tolist()}")
+            self.log(f"  Class distribution: [{counts_str}]")
+            self.log("")
+            self.log("[EXPORT] ─── Next steps ───")
+            self.log("  1. Go to https://colab.research.google.com")
+            self.log("  2. Upload timegan_colab.ipynb (from this project folder)")
+            self.log("  3. Upload these 3 files from 'timegan_colab_data/' folder")
+            self.log("  4. Run the notebook (Runtime → Run all) — takes ~10 min on GPU")
+            self.log("  5. Download timegan_checkpoint.pt")
+            self.log("  6. Enter its path in the 'Path to timegan_checkpoint.pt' field")
+            self.log("  7. Check 'TimeGAN Oversampling' → click Step 9 to train")
+            self.log("[EXPORT] ─────────────────")
+
+        except Exception as e:
+            self.log(f"[ERROR] Export failed: {e}")
+            import traceback
+            self.log(traceback.format_exc())
 
     def step_save_model(self):
         if self.hvdnet_model is None:
@@ -2818,6 +3020,7 @@ class HVDMainWindow(QMainWindow):
             and self.balance_classes_checkbox.isChecked()
         )
         dataset_info = self.build_training_dataset(task_name, balance_classes=balance_classes)
+        self.last_built_dataset = dataset_info
         x_tensor = dataset_info['x_tensor']
         y_tensor = dataset_info['y_tensor']
         z_tensor = dataset_info['z_tensor']

@@ -36,3 +36,9 @@ CEBS_Data/
 # patient Data
 *.csv
 *.json
+
+# timegann weights
+*.npy
+
+weights/*.npy
+timegan_colab_data/

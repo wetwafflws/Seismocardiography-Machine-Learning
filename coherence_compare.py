@@ -152,6 +152,58 @@ def rms_normalize(signal_in):
     return signal_in / rms
 
 
+def _detrend(signal_in):
+    """Remove linear trend from signal."""
+    if len(signal_in) < 2:
+        return signal_in
+    x_axis = np.arange(len(signal_in))
+    coeffs = np.polyfit(x_axis, signal_in, 1)
+    trend = np.polyval(coeffs, x_axis)
+    return signal_in - trend
+
+
+def _welch_per_segment(x, y, fs, nperseg, noverlap, window="hann"):
+    """Compute cross-spectrum and auto-power spectra using Welch's method manually."""
+    win = signal.get_window(window, nperseg)
+    step = nperseg - noverlap
+
+    n_segments = (len(x) - noverlap) // step
+
+    # Pre-compute segment indices
+    starts = np.arange(0, len(x) - nperseg + 1, step)
+    starts = starts[:n_segments]
+
+    if len(starts) == 0:
+        return np.array([]), np.array([]), np.array([])
+
+    n_freq = nperseg // 2 + 1
+    pxx_sum = np.zeros(n_freq, dtype=np.float64)
+    pyy_sum = np.zeros(n_freq, dtype=np.float64)
+    pxy_sum = np.zeros(n_freq, dtype=np.complex128)
+
+    for start in starts:
+        xs = x[start : start + nperseg] * win
+        ys = y[start : start + nperseg] * win
+
+        xs = _detrend(xs)
+        ys = _detrend(ys)
+
+        X = np.fft.rfft(xs)
+        Y = np.fft.rfft(ys)
+
+        pxx_sum += (X.real ** 2 + X.imag ** 2).real
+        pyy_sum += (Y.real ** 2 + Y.imag ** 2).real
+        pxy_sum += X * np.conj(Y)
+
+    n_avged = len(starts)
+    pxx_avg = pxx_sum / n_avged
+    pyy_avg = pyy_sum / n_avged
+    pxy_avg = pxy_sum / n_avged
+
+    f = np.fft.rfftfreq(nperseg, d=1.0 / fs)
+    return f, pxx_avg, pyy_avg, pxy_avg
+
+
 def compute_coherence(x, y, fs, low_hz=1.0, high_hz=40.0):
     min_len = min(len(x), len(y))
     if min_len < 4:
@@ -159,9 +211,6 @@ def compute_coherence(x, y, fs, low_hz=1.0, high_hz=40.0):
 
     x = x[:min_len]
     y = y[:min_len]
-
-    if np.allclose(x, y):
-        return np.array([]), np.array([])
 
     x = rms_normalize(x)
     y = rms_normalize(y)
@@ -172,14 +221,22 @@ def compute_coherence(x, y, fs, low_hz=1.0, high_hz=40.0):
 
     noverlap = nperseg // 2
 
-    f, cxy = signal.coherence(
-        x,
-        y,
-        fs=fs,
-        nperseg=nperseg,
-        noverlap=noverlap,
-        window="hann",
-    )
+    # Detrend full signals before segmenting
+    x = _detrend(x)
+    y = _detrend(y)
+
+    result = _welch_per_segment(x, y, fs, nperseg, noverlap, window="hann")
+    if len(result[0]) == 0:
+        return np.array([]), np.array([])
+
+    f, pxx, pyy, pxy = result
+
+    # Coherence = |Pxy|^2 / (Pxx * Pyy)
+    # Avoid division by zero
+    denom = pxx * pyy
+    eps = 1e-30
+    cxy = np.where(denom > eps, np.abs(pxy) ** 2 / denom, 0.0)
+    cxy = np.clip(cxy, 0.0, 1.0)
 
     mask = (f >= low_hz) & (f <= high_hz)
     return f[mask], cxy[mask]
@@ -334,7 +391,7 @@ fig.update_layout(
 fig.update_xaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
 fig.update_yaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
 
-st.plotly_chart(fig, use_container_width=True)
+st.plotly_chart(fig, width='stretch', key="coherence_plot")
 
 st.subheader("Segment Preview")
 
@@ -354,7 +411,7 @@ with preview_col_a:
     fig_a.update_layout(height=350, plot_bgcolor="white", margin=dict(t=40, b=40))
     fig_a.update_xaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
     fig_a.update_yaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
-    st.plotly_chart(fig_a, use_container_width=True)
+    st.plotly_chart(fig_a, width='stretch', key="preview_a")
 
 with preview_col_b:
     st.markdown(f"**{subject_b}**")
@@ -365,7 +422,7 @@ with preview_col_b:
     fig_b.update_layout(height=350, plot_bgcolor="white", margin=dict(t=40, b=40))
     fig_b.update_xaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
     fig_b.update_yaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
-    st.plotly_chart(fig_b, use_container_width=True)
+    st.plotly_chart(fig_b, width='stretch', key="preview_b")
 
 st.subheader("Coherence Segments")
 time_axis = np.arange(min_len) / fs
@@ -387,7 +444,7 @@ fig_segments.update_layout(
 fig_segments.update_xaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
 fig_segments.update_yaxes(showgrid=True, gridcolor="rgba(200, 200, 200, 0.3)")
 
-st.plotly_chart(fig_segments, use_container_width=True)
+st.plotly_chart(fig_segments, width='stretch', key="segments_plot")
 
 st.caption(
     f"Class: {class_label} | Subjects: {subject_a}, {subject_b} | "

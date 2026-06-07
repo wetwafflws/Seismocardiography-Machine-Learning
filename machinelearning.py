@@ -548,13 +548,13 @@ class HVDNet(nn.Module):
         self.bn_x = nn.BatchNorm1d(d)
         self.bn_y = nn.BatchNorm1d(d)
         self.bn_z = nn.BatchNorm1d(d)
-        self.dropout_sa = nn.Dropout(p=0.7)
+        self.dropout_sa = nn.Dropout(p=0.3)
 
         self.classifier = nn.Sequential(
             nn.Linear(3 * d, d),
             nn.ReLU(),
             nn.BatchNorm1d(d),
-            nn.Dropout(p=0.6),
+            nn.Dropout(p=0.3),
             nn.Linear(d, num_classes)
         )
 

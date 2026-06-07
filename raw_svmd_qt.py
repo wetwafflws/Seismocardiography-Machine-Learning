@@ -1978,12 +1978,28 @@ def run_window_analysis(inputs: dict) -> dict:
     if len(scg_window) < 25:
         return {"warning": "Window too short for SVMD."}
 
+    # Slice the raw signal window if raw signal is available
+    if "scg_raw" in inputs and "fs_infer" in inputs and len(inputs["scg_raw"]) > 0:
+        scg_raw = inputs["scg_raw"]
+        fs_infer = float(inputs["fs_infer"])
+        start_raw_idx = int(start_time * fs_infer)
+        end_raw_idx = min(int((start_time + window_size) * fs_infer), len(scg_raw))
+        scg_raw_window = scg_raw[start_raw_idx:end_raw_idx]
+        if len(scg_raw_window) == len(scg_window):
+            scg_raw_window_resampled = scg_raw_window
+        else:
+            scg_raw_window_resampled = signal.resample(scg_raw_window, len(scg_window)) if len(scg_raw_window) > 0 else np.array([])
+    else:
+        scg_raw_window_resampled = np.array([])
+
     modes, omegas = svmd(scg_window, max_alpha=int(inputs["svmd_alpha"]), tau=0, stopc=3)
     if len(omegas) == 0:
         return {"warning": "SVMD returned no modes. Try adjusting parameters."}
 
     s_ao, wfs, wf_mean, selected_idx = select_ao_modes(modes, omegas, fs_proc)
     s_ao_7, envelope, smoothed_env, peaks = extract_ao_peaks(s_ao, fs_proc, float(inputs["prominence_factor"]), power=int(inputs["power_exp"]))
+
+    center_freq_hz = np.abs(omegas) * fs_proc
 
     ppg_peaks_full = inputs["ppg_peaks_full"]
     beat_times_s = inputs["beat_times_s"]
@@ -2058,8 +2074,11 @@ def run_window_analysis(inputs: dict) -> dict:
         "window_size": window_size,
         "time_axis": np.linspace(start_time, start_time + window_size, len(scg_window)) if len(scg_window) > 0 else np.array([]),
         "scg_window": scg_window,
+        "scg_raw_window_resampled": scg_raw_window_resampled,
         "modes": modes,
         "omegas": omegas,
+        "selected_idx": selected_idx,
+        "center_freq_hz": center_freq_hz,
         "s_ao": s_ao,
         "s_ao_7": s_ao_7,
         "envelope": envelope,
@@ -2892,6 +2911,14 @@ class RawScgSvmdWindow(QMainWindow):
         batch_row.addWidget(self.batch_export_button)
         batch_row.addWidget(self.batch_min_seconds_spin)
         actions_layout.addLayout(batch_row)
+        self.batch_full_button = QPushButton("Batch Full Analysis")
+        self.batch_save_csv_check = QCheckBox("Save recap CSV")
+        self.batch_save_csv_check.setChecked(False)
+        self.batch_full_status = QLabel("")
+        self.batch_full_status.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
+        actions_layout.addWidget(self.batch_full_button)
+        actions_layout.addWidget(self.batch_save_csv_check)
+        actions_layout.addWidget(self.batch_full_status)
         self.batch_export_status = QLabel("")
         self.batch_export_status.setStyleSheet(f"color:{TEXT_DIM};font-size:10px;")
         actions_layout.addWidget(self.batch_export_status)
@@ -2907,11 +2934,13 @@ class RawScgSvmdWindow(QMainWindow):
         self.overview_tab = QWidget()
         self.window_tab = QWidget()
         self.full_tab = QWidget()
+        self.batch_tab = QWidget()
         self.logs_tab = QWidget()
         self.tabs.addTab(self.capture_tab, "Real-time Capture")
         self.tabs.addTab(self.overview_tab, "Overview")
         self.tabs.addTab(self.window_tab, "Window Analysis")
         self.tabs.addTab(self.full_tab, "Full Record")
+        self.tabs.addTab(self.batch_tab, "Batch Recap")
         self.tabs.addTab(self.logs_tab, "Logs")
 
         # ── Capture Tab Layout ────────────────────────────────────────────────
@@ -2958,6 +2987,15 @@ class RawScgSvmdWindow(QMainWindow):
 
         overview_hbox.addWidget(active_panel, stretch=2)
 
+        batch_layout = QVBoxLayout(self.batch_tab)
+        batch_layout.setContentsMargins(10, 10, 10, 10)
+        batch_layout.setSpacing(8)
+        batch_layout.addWidget(QLabel("Batch Full Analysis Recap"))
+        self.batch_recap_view = QTextBrowser()
+        self.batch_recap_view.setReadOnly(True)
+        self.batch_recap_view.setOpenLinks(False)
+        batch_layout.addWidget(self.batch_recap_view)
+
         window_root_layout = QVBoxLayout(self.window_tab)
         self.window_scroll_area = QScrollArea()
         self.window_scroll_area.setWidgetResizable(True)
@@ -2971,12 +3009,24 @@ class RawScgSvmdWindow(QMainWindow):
         window_layout.setContentsMargins(4, 4, 12, 12)
         self.window_scroll_area.setWidget(window_container)
 
-        self.window_overlay_plot = MplPlotWidget("Processed SCG with AO Peaks and PPG Beats", width=11, height=4.0, dpi=100)
-        self.window_env_plot = MplPlotWidget("AO Reconstruction and Envelope", width=11, height=4.0, dpi=100, sharex=self.window_overlay_plot.axes)
+        self.window_raw_plot = MplPlotWidget("1. Raw SCG Signal", width=11, height=3.0, dpi=100)
+        self.window_filtered_plot = MplPlotWidget("2. Filtered SCG Signal", width=11, height=3.0, dpi=100, sharex=self.window_raw_plot.axes)
+        self.window_decomposed_plot = MplPlotWidget("3. SVMD Decomposed Modes", width=11, height=5.0, dpi=100, sharex=self.window_raw_plot.axes)
+        self.window_reconstructed_plot = MplPlotWidget("4. Reconstructed AO Signal", width=11, height=3.0, dpi=100, sharex=self.window_raw_plot.axes)
+        self.window_power7_plot = MplPlotWidget("5. Reconstructed Signal after 7th Power", width=11, height=3.0, dpi=100, sharex=self.window_raw_plot.axes)
+        self.window_detected_power7_plot = MplPlotWidget("6. Detected Peaks at 7th Power (Envelope)", width=11, height=3.0, dpi=100, sharex=self.window_raw_plot.axes)
+        self.window_peaks_original_plot = MplPlotWidget("7. Original SCG Signal with Detected Peaks", width=11, height=3.0, dpi=100, sharex=self.window_raw_plot.axes)
+
         self.window_metrics_table = QTableWidget()
         self.window_metrics_table.setMinimumHeight(180)
-        window_layout.addWidget(self.window_overlay_plot)
-        window_layout.addWidget(self.window_env_plot)
+
+        window_layout.addWidget(self.window_raw_plot)
+        window_layout.addWidget(self.window_filtered_plot)
+        window_layout.addWidget(self.window_decomposed_plot)
+        window_layout.addWidget(self.window_reconstructed_plot)
+        window_layout.addWidget(self.window_power7_plot)
+        window_layout.addWidget(self.window_detected_power7_plot)
+        window_layout.addWidget(self.window_peaks_original_plot)
         window_layout.addWidget(self.window_metrics_table)
 
         full_root_layout = QVBoxLayout(self.full_tab)
@@ -3228,6 +3278,7 @@ class RawScgSvmdWindow(QMainWindow):
         self.run_full_button.clicked.connect(self._run_full_analysis)
         self.export_ml_button.clicked.connect(self._export_full_record_for_ml)
         self.batch_export_button.clicked.connect(self._batch_export_for_ml)
+        self.batch_full_button.clicked.connect(self._batch_full_record_analysis)
         self.source_mode.currentIndexChanged.connect(self._update_source_controls)
         self.beat_source_combo.currentIndexChanged.connect(self._update_ppg_json_toggle)
         self.date_combo.currentIndexChanged.connect(self._on_date_changed)
@@ -3718,6 +3769,8 @@ class RawScgSvmdWindow(QMainWindow):
         return {
             **self._base_params(),
             "scg_proc_full": self.scg_proc_full,
+            "scg_raw": self.scg_raw,
+            "fs_infer": self.fs_infer,
             "start_time": self.window_start_spin.value(),
             "window_size": self.window_size_spin.value(),
             "svmd_alpha": self.svmd_alpha_spin.value(),
@@ -4063,41 +4116,400 @@ class RawScgSvmdWindow(QMainWindow):
         )
         QMessageBox.information(self, "Batch export complete", summary)
 
+    def _render_batch_recap(self, recap_rows: list[dict], summary: dict) -> None:
+        if not hasattr(self, "batch_recap_view"):
+            return
+
+        if not recap_rows:
+            self.batch_recap_view.setHtml(
+                f"<b>No batch recap generated.</b><br>{summary.get('message', '')}"
+            )
+            return
+
+        header_cells = "".join(
+            f"<th style='padding:6px;border-bottom:1px solid #e2e8f0;text-align:left;'>{h}</th>"
+            for h in summary.get("headers", [])
+        )
+        body_rows = ""
+        for row in recap_rows:
+            cells = "".join(
+                f"<td style='padding:6px;border-bottom:1px solid #edf2f7;'>{row.get(h, '')}</td>"
+                for h in summary.get("headers", [])
+            )
+            body_rows += f"<tr>{cells}</tr>"
+
+        skipped = summary.get("skipped", 0)
+        failed = summary.get("failed", 0)
+        min_duration = summary.get("min_duration", 0.0)
+        csv_path = summary.get("csv_path", "")
+        csv_line = f"Recap CSV: {csv_path}" if csv_path else "Recap CSV: not saved"
+
+        failed_list = ""
+        if summary.get("failed_details"):
+            failed_items = "".join(
+                f"<li>{item}</li>" for item in summary["failed_details"]
+            )
+            failed_list = f"<div style='margin-top:6px;'><b>Failed:</b><ul>{failed_items}</ul></div>"
+
+        html = f"""
+        <html>
+        <body style="font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; font-size:12px;">
+            <div style="margin-bottom:8px;">
+                <b>Batch Full Analysis Recap</b><br>
+                Processed: {len(recap_rows)} | Skipped (< {min_duration:.1f}s): {skipped} | Failed: {failed}<br>
+                {csv_line}
+            </div>
+            <table style="border-collapse:collapse;width:100%;">
+                <thead><tr>{header_cells}</tr></thead>
+                <tbody>{body_rows}</tbody>
+            </table>
+            {failed_list}
+        </body>
+        </html>
+        """
+        self.batch_recap_view.setHtml(html)
+
+    def _batch_full_record_analysis(self):
+        search_dir = Path(self.search_dir_edit.text().strip() or DEFAULT_SEARCH_DIR)
+        if not search_dir.exists() or not search_dir.is_dir():
+            QMessageBox.warning(self, "Missing folder", "Workspace folder does not exist.")
+            return
+
+        def _metric_value(val, digits=4):
+            if val is None:
+                return "N/A"
+            try:
+                if np.isfinite(val):
+                    return round(float(val), digits)
+            except Exception:
+                return "N/A"
+            return "N/A"
+
+        min_duration = float(self.batch_min_seconds_spin.value())
+        candidates = sorted(search_dir.rglob("*.csv"))
+        if not candidates:
+            QMessageBox.information(self, "No files", "No CSV files found for batch analysis.")
+            return
+
+        recap_rows = []
+        skipped_paths = []
+        failed_paths = []
+
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        out_dir = os.path.join(script_dir, "Batch_Reports")
+
+        for path in candidates:
+            duration_s = _get_csv_duration(path)
+            if duration_s < min_duration:
+                skipped_paths.append(path)
+                continue
+
+            try:
+                raw_df = _read_csv_from_source(None, str(path))
+                df = _prepare_df(raw_df)
+            except Exception as exc:
+                failed_paths.append((path, str(exc)))
+                continue
+
+            scg_df = df[df[["x_g", "y_g", "z_g"]].notna().any(axis=1)].copy()
+            if scg_df.empty:
+                failed_paths.append((path, "No SCG samples found"))
+                continue
+
+            beats_df = df[df["beat_event"] == 1].copy()
+            ppg_df = df[df[OPTIONAL_PPG_COL].notna()].copy() if OPTIONAL_PPG_COL in df.columns else pd.DataFrame()
+
+            t0 = float(scg_df["timestamp_ms"].iloc[0])
+            scg_df["time_s"] = (scg_df["timestamp_ms"] - t0) / 1000.0
+            beats_df["time_s"] = (beats_df["timestamp_ms"] - t0) / 1000.0 if not beats_df.empty else np.array([])
+            if not ppg_df.empty:
+                ppg_df["time_s"] = (ppg_df["timestamp_ms"] - t0) / 1000.0
+
+            duration_s, actual_hz = _compute_rate(scg_df)
+            fs_infer = self.override_hz_spin.value() if self.override_fs_check.isChecked() else actual_hz
+            if fs_infer <= 0:
+                failed_paths.append((path, "Invalid sampling rate inferred"))
+                continue
+
+            scg_raw = scg_df["z_g"].to_numpy(dtype=float)
+            scg_proc_full, fs_proc = _processing_signal(
+                scg_raw,
+                fs_infer,
+                float(self.target_fs_spin.value()),
+                self.preprocessing_mode.currentText(),
+            )
+
+            beat_times_s = beats_df["time_s"].to_numpy(dtype=float) if len(beats_df) > 0 else np.array([], dtype=float)
+            ppg_info = _current_ppg_info(
+                ppg_df,
+                beat_times_s,
+                self.beat_source_combo.currentText(),
+                self.ppg_bp_low_spin.value(),
+                self.ppg_bp_high_spin.value(),
+                self.ppg_max_bpm_spin.value(),
+                self.ppg_prom_spin.value(),
+                fs_proc,
+            )
+
+            max_t = float(scg_df["time_s"].iloc[-1]) if not scg_df.empty else 0.0
+            if max_t <= 0:
+                failed_paths.append((path, "Record duration invalid"))
+                continue
+
+            inputs = self._base_params()
+            inputs.update({
+                "scg_proc_full": scg_proc_full,
+                "scg_raw": scg_raw,
+                "fs_proc": fs_proc,
+                "fs_infer": fs_infer,
+                "trim_start": 0.0,
+                "trim_end": max_t,
+                "beat_times_s": ppg_info.get("beat_times_s", np.array([], dtype=float)),
+                "ppg_peaks_ref": ppg_info.get("ppg_peaks_ref", np.array([], dtype=int)),
+                "ppg_peaks_full": ppg_info.get("ppg_peaks_full", np.array([], dtype=int)),
+                "ppg_peak_times_s": ppg_info.get("ppg_peak_times_s", np.array([], dtype=float)),
+                "ref_fs": ppg_info.get("ref_fs", 100.0),
+                "show_sqa_overlay": self.show_sqa_overlay.isChecked(),
+                "sqa_segment_seconds": self.sqa_segment_spin.value(),
+                "min_flags_to_reject": self.min_flags_spin.value(),
+                "kurt_thresh": self.kurt_thresh_spin.value(),
+                "zcr_low": self.zcr_low_spin.value(),
+                "zcr_high": self.zcr_high_spin.value(),
+                "env_thresh": self.env_thresh_spin.value(),
+                "rms_low_percentile": self.rms_low_percentile_spin.value(),
+                "rms_high_percentile": self.rms_high_percentile_spin.value(),
+                "rms_low_mad_mult": self.rms_low_mad_spin.value(),
+                "rms_high_mad_mult": self.rms_high_mad_spin.value(),
+                "exclude_bad_windows": self.exclude_bad_windows_check.isChecked(),
+                "bad_window_fraction_threshold": self.bad_window_fraction_spin.value(),
+                "use_iqr_filter": self.use_iqr_filter_check.isChecked(),
+                "svmd_alpha": self.svmd_alpha_spin.value(),
+                "prominence_factor": self.prominence_spin.value(),
+                "power_exp": self.power_spin.value(),
+                "save_json_output": self.save_json_check.isChecked(),
+                "save_ppg_json_output": self.save_ppg_json_check.isChecked(),
+                "output_folder": self.output_folder_edit.text().strip() or "Saved_Peaks",
+                "beat_source": self.beat_source_combo.currentText(),
+                "file_label": path.stem,
+            })
+
+            try:
+                result = run_full_record_analysis(inputs)
+            except Exception as exc:
+                failed_paths.append((path, str(exc)))
+                continue
+
+            meta, _ = _read_metadata_for_csv(str(path))
+            meta = meta or {}
+            initials = (meta.get("patient_initials") or path.stem.split("_")[0]).upper()
+            sex = meta.get("sex", "")
+            bmi = meta.get("bmi", "")
+            conds = meta.get("cardiac_conditions") or ["Normal"]
+            if not isinstance(conds, list):
+                conds = [str(conds)]
+            conditions = "; ".join([str(c) for c in conds])
+
+            ptt_best = result.get("ptt_best_segment")
+            ptt_segment_corr = "N/A"
+            if ptt_best and isinstance(ptt_best, dict):
+                corr_val = ptt_best.get("corr")
+                ptt_segment_corr = _metric_value(corr_val)
+
+            sqa_rejected = "N/A"
+            sqa_result = result.get("sqa_result_full_record")
+            if sqa_result and "bad_mask" in sqa_result:
+                sqa_rejected = int(np.sum(sqa_result.get("bad_mask", [])))
+
+            recap_rows.append({
+                "record": path.name,
+                "initials": initials,
+                "sex": sex,
+                "conditions": conditions,
+                "bmi": bmi,
+                "duration_s": round(max_t, 2),
+                "ao_peaks": int(len(result.get("all_ao_peaks", []))),
+                "ppg_peaks": int(len(result.get("ppg_peaks_full_trim", []))),
+                "interval_corr": _metric_value(result.get("correlation", np.nan)),
+                "ptt_shift_s": _metric_value(result.get("ptt_seconds", np.nan), digits=5),
+                "ptt_segment_corr": ptt_segment_corr,
+                "sqa_rejected_segments": sqa_rejected,
+                "sqa_skipped_windows": result.get("skipped_bad_windows", 0),
+            })
+
+        recap_csv_path = ""
+        if self.batch_save_csv_check.isChecked():
+            os.makedirs(out_dir, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            recap_csv_path = os.path.join(out_dir, f"batch_full_recap_{timestamp}.csv")
+        headers = [
+            "record",
+            "initials",
+            "sex",
+            "conditions",
+            "bmi",
+            "duration_s",
+            "ao_peaks",
+            "ppg_peaks",
+            "interval_corr",
+            "ptt_shift_s",
+            "ptt_segment_corr",
+            "sqa_rejected_segments",
+            "sqa_skipped_windows",
+        ]
+
+        if recap_rows and recap_csv_path:
+            with open(recap_csv_path, "w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=headers)
+                writer.writeheader()
+                writer.writerows(recap_rows)
+
+        failed_details = [f"{p.name}: {err}" for p, err in failed_paths]
+        summary = {
+            "skipped": len(skipped_paths),
+            "failed": len(failed_paths),
+            "min_duration": min_duration,
+            "csv_path": recap_csv_path if recap_rows else "",
+            "headers": headers,
+            "failed_details": failed_details,
+            "message": "No eligible records to analyze.",
+        }
+
+        self._render_batch_recap(recap_rows, summary)
+        if hasattr(self, "batch_full_status"):
+            status_text = f"Batch full analysis: {len(recap_rows)}"
+            if recap_rows:
+                if recap_csv_path:
+                    status_text += f" | Recap: {os.path.relpath(recap_csv_path, script_dir)}"
+                else:
+                    status_text += " | Recap: not saved"
+            self.batch_full_status.setText(status_text)
+
+        summary_text = (
+            f"Processed: {len(recap_rows)}\n"
+            f"Skipped (duration < {min_duration:.1f}s): {len(skipped_paths)}\n"
+            f"Failed: {len(failed_paths)}"
+        )
+        QMessageBox.information(self, "Batch full analysis complete", summary_text)
+
     def _render_window_result(self, result: dict):
-        self.window_overlay_plot.clear()
-        self.window_env_plot.clear()
+        self.window_raw_plot.clear()
+        self.window_filtered_plot.clear()
+        self.window_decomposed_plot.clear()
+        self.window_reconstructed_plot.clear()
+        self.window_power7_plot.clear()
+        self.window_detected_power7_plot.clear()
+        self.window_peaks_original_plot.clear()
+
         time_axis = result.get("time_axis", np.array([]))
         scg_window = result.get("scg_window", np.array([]))
-        peaks = result.get("peaks", np.array([], dtype=int))
-        ppg_peaks_window = result.get("ppg_peaks_window", np.array([], dtype=int))
+        scg_raw_window_resampled = result.get("scg_raw_window_resampled", np.array([]))
+        modes = result.get("modes", np.array([]))
+        selected_idx = result.get("selected_idx", np.array([], dtype=int))
+        center_freq_hz = result.get("center_freq_hz", np.array([]))
         s_ao = result.get("s_ao", np.array([]))
+        s_ao_7 = result.get("s_ao_7", np.array([]))
         envelope = result.get("envelope", np.array([]))
         smoothed_env = result.get("smoothed_env", np.array([]))
+        peaks = result.get("peaks", np.array([], dtype=int))
+        ppg_peaks_window = result.get("ppg_peaks_window", np.array([], dtype=int))
 
-        ax = self.window_overlay_plot.axes
-        ax.plot(time_axis, scg_window, color="#1f3a93", linewidth=1.3, label="Processed SCG")
+        # 1. Raw signal
+        ax = self.window_raw_plot.axes
+        if len(scg_raw_window_resampled) > 0:
+            ax.plot(time_axis, scg_raw_window_resampled, color="#7f8c8d", linewidth=1.2, label="Raw SCG (z-axis)")
+            ax.legend(loc="upper right")
+        else:
+            ax.text(0.5, 0.5, "Raw signal not available", ha="center", va="center", transform=ax.transAxes)
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.25)
+        self.window_raw_plot.draw()
+
+        # 2. Filtered signal
+        ax = self.window_filtered_plot.axes
+        ax.plot(time_axis, scg_window, color="#1f3a93", linewidth=1.3, label="Filtered SCG")
+        ax.legend(loc="upper right")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.25)
+        self.window_filtered_plot.draw()
+
+        # 3. Decomposed SVMD Modes
+        ax = self.window_decomposed_plot.axes
+        if len(modes) > 0:
+            max_amp = np.max(np.abs(modes))
+            spacing = max_amp * 1.5 if max_amp > 0 else 1.0
+            for idx, mode in enumerate(modes):
+                offset = -idx * spacing
+                is_selected = idx in selected_idx
+                freq = center_freq_hz[idx] if idx < len(center_freq_hz) else 0.0
+                color = "#e74c3c" if is_selected else "#7f8c8d"
+                label = f"Mode {idx} ({freq:.2f} Hz) [Selected]" if is_selected else f"Mode {idx} ({freq:.2f} Hz)"
+                ax.plot(time_axis, mode + offset, color=color, linewidth=1.1, label=label)
+                ax.axhline(offset, color="gray", linestyle=":", alpha=0.3)
+            ax.legend(loc="upper right", fontsize=8)
+            selected_str = ", ".join([f"Mode {i} ({center_freq_hz[i]:.1f} Hz)" for i in selected_idx])
+            ax.set_title(f"3. SVMD Decomposed Modes (Selected: {selected_str if selected_str else 'None'})")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude (offset)")
+        ax.grid(True, alpha=0.25)
+        self.window_decomposed_plot.draw()
+
+        # 4. Reconstructed AO Signal
+        ax = self.window_reconstructed_plot.axes
+        ax.plot(time_axis, s_ao, color="#2c3e50", linewidth=1.2, label="Reconstructed AO Signal")
+        ax.legend(loc="upper right")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.25)
+        self.window_reconstructed_plot.draw()
+
+        # 5. Reconstructed Signal after 7th Power
+        ax = self.window_power7_plot.axes
+        power_exp = int(self.power_spin.value())
+        ax.plot(time_axis, s_ao_7, color="#8e44ad", linewidth=1.2, label=f"AO Signal ({power_exp}th Power)")
+        ax.legend(loc="upper right")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.25)
+        self.window_power7_plot.draw()
+
+        # 6. Detected Peaks at 7th Power (Envelope)
+        ax = self.window_detected_power7_plot.axes
+        ax.plot(time_axis, s_ao_7, color="#ddd", linewidth=1.0, label="7th Power Signal", alpha=0.7)
+        ax.plot(time_axis, envelope, color="#2ecc71", linewidth=1.1, label="Hilbert Envelope")
+        ax.plot(time_axis, smoothed_env, color="#f39c12", linewidth=1.3, label="Smoothed Envelope")
         if len(peaks) > 0:
-            ax.scatter(time_axis[peaks], scg_window[peaks], s=28, color="red", label="AO Peaks")
+            ax.scatter(time_axis[peaks], smoothed_env[peaks], s=35, color="red", zorder=5, label="Detected Peaks")
+        ax.legend(loc="upper right")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylabel("Amplitude")
+        ax.grid(True, alpha=0.25)
+        self.window_detected_power7_plot.draw()
+
+        # 7. Original SCG Signal with Detected Peaks
+        ax = self.window_peaks_original_plot.axes
+        if len(scg_raw_window_resampled) > 0:
+            ax.plot(time_axis, scg_raw_window_resampled, color="#7f8c8d", linewidth=1.2, label="Raw SCG")
+            if len(peaks) > 0:
+                ax.scatter(time_axis[peaks], scg_raw_window_resampled[peaks], s=35, color="red", zorder=5, label="AO Peaks on Raw")
+        else:
+            ax.plot(time_axis, scg_window, color="#1f3a93", linewidth=1.3, label="Filtered SCG")
+            if len(peaks) > 0:
+                ax.scatter(time_axis[peaks], scg_window[peaks], s=35, color="red", zorder=5, label="AO Peaks on Filtered")
+        
+        # Also overlay PPG vertical lines as reference like before
         if len(ppg_peaks_window) > 0:
             for bt in time_axis[ppg_peaks_window]:
                 ax.axvline(float(bt), color="#27ae60", linestyle="--", linewidth=1)
-        ax.set_xlabel("Time (s)")
-        ax.set_ylabel("Amplitude")
-        ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper right")
-        self.window_overlay_plot.draw()
+            # Add PPG dummy line for the legend
+            ax.plot([], [], color="#27ae60", linestyle="--", linewidth=1, label="PPG Beat Reference")
 
-        ax = self.window_env_plot.axes
-        ax.plot(time_axis, s_ao, color="#666666", linewidth=1.2, label="Reconstructed AO")
-        ax.plot(time_axis, envelope, color="#2ecc71", linewidth=1.2, label="Envelope")
-        ax.plot(time_axis, smoothed_env, color="#f39c12", linewidth=1.2, label="Smoothed Env")
-        if len(peaks) > 0:
-            ax.scatter(time_axis[peaks], smoothed_env[peaks], s=25, color="red", label="Detected AO Peaks")
+        ax.legend(loc="upper right")
         ax.set_xlabel("Time (s)")
         ax.set_ylabel("Amplitude")
         ax.grid(True, alpha=0.25)
-        ax.legend(loc="upper right")
-        self.window_env_plot.draw()
+        self.window_peaks_original_plot.draw()
 
         rows = []
         comp = result.get("comparison") or {}
